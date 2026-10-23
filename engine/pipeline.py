@@ -228,6 +228,7 @@ def main() -> None:
 
     cat, sku, _ = run_dml(panel)
     cat_rob, _, _ = run_dml(panel, sales_weeks_only=True)
+    cat_rob.to_parquet(ARTIFACT_DIR / "elasticity_robust.parquet")
     cat.assign(spec="ln(Q+1), all weeks").to_parquet(PATHS.elasticity_cat)
     sku.to_parquet(PATHS.elasticity_sku)
     print(f"[3] elasticity ({time.time() - t0:.0f}s)\n{cat.round(3).to_string()}")
@@ -268,6 +269,10 @@ def main() -> None:
 
     write_ai_report(cat, cat_v, mod, pm, rl)
     print(f"report -> {REPORT_DIR / 'results.md'}")
+
+    # ---- Phase 6: the Margem web app ---------------------------------------
+    from .webexport import build as build_web
+    build_web()
 
 
 if __name__ == "__main__":

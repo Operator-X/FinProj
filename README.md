@@ -29,7 +29,7 @@ This engine turns transaction-level marketplace data into pricing decisions that
 8. [Phase 3: causal price elasticity (Double ML)](#8-phase-3-causal-price-elasticity-double-ml)
 9. [Phase 4: constrained price optimisation](#9-phase-4-constrained-price-optimisation)
 10. [Phase 5: AI decision layer](#10-phase-5-ai-decision-layer)
-11. [Phase 6: interactive dashboard](#11-phase-6-interactive-dashboard)
+11. [Phase 6: Margem, the product](#11-phase-6-margem-the-product)
 12. [Results](#12-results)
 13. [Tests](#13-tests)
 14. [Design decisions](#14-design-decisions)
@@ -60,11 +60,13 @@ uv run python -m engine.reviews           # ~35 batched `claude -p --model haiku
 uv run python -m engine.pipeline          # -> artifacts/*.parquet, reports/results.md
 uv run python -m engine.rl train eval     # optional: retrain the PPO agent (~4.5 min) and re-evaluate
 
-# 4) Phase 6: dashboard
-uv run streamlit run app.py               # http://localhost:8501
+# 4) Phase 6: the Margem web app (rebuilt automatically at the end of the pipeline)
+uv run python -m engine.webexport         # -> web/margem.html, one self-contained file
+web/publish.sh                            # publish to https://operator-x.github.io/margem/ (the poster QR code)
+uv run python -m engine.api              # optional: same page from the Python reference server (http://127.0.0.1:8600)
 
 # 5) Tests
-uv run pytest                             # 36 tests
+uv run pytest                             # 40 tests
 ```
 
 - **Model downloads:** the first pipeline run downloads two Chronos foundation models from Hugging Face (`amazon/chronos-bolt-small`, `amazon/chronos-2`).
@@ -96,7 +98,7 @@ Phase 4  This week's price: constrained CM2 − carry optimiser ◄─┘
                               │
 Phase 5A  Whole-season price path: RL agent (PPO) benchmarked against exact dynamic programming
                               │
-Phase 6  Interactive dashboard: 6 tabs, every interaction < 200 ms
+Phase 6  Margem: the product (web app with Capi the capybara), full engine in the browser, public at operator-x.github.io/margem
 ```
 
 | Phase | Question it answers | Module |
@@ -109,14 +111,14 @@ Phase 6  Interactive dashboard: 6 tabs, every interaction < 200 ms
 | 5A | What is the best price *path* to sell a lot of stock over a season? | `rl.py` |
 | 5B | How much stock, and how much working capital, does a target service level need? | `foundation.py` |
 | 5C | What do customers say, and does it change price sensitivity? | `reviews.py` |
-| 6 | How does a decision-maker explore all of this live? | `app.py` |
+| 6 | How does a seller, or a judge, use all of this in 30 seconds? | `web/`, `webexport.py`, `api.py` |
 
 Phases 1–4 form the **causal pricing core**. Phase 5 adds the **AI decision layer**:
 - 5A extends the one-week decision to a whole season;
 - 5B turns point forecasts into calibrated distributions, and so into capital requirements;
 - 5C adds unstructured text to the causal model.
 
-Phase 6 puts every phase in front of the user.
+Phase 6 puts every phase in front of the user as **Margem**, a pricing copilot with its own identity (Capi the capybara, notes in the margin), and a small server that runs the real engine behind it on demand.
 
 ---
 
@@ -160,10 +162,22 @@ finproj/
 │   ├── rl.py                # Phase 5A: sell-through simulator, exact DP, PPO agent, Bayesian elasticity learning
 │   ├── foundation.py        # Phase 5B: Chronos foundation models vs LightGBM quantiles, newsvendor backtest
 │   ├── reviews.py           # Phase 5C: LLM review coding (Claude) -> leakage-safe customer-voice features
-│   └── pipeline.py          # batch orchestration of Phases 1-5 + reports/results.md writer
-├── app.py                   # Phase 6: Streamlit dashboard, 6 tabs (reads artifacts only)
-├── tests/test_engine.py     # Phases 0-4 and 6: guardrails, leakage, Lerner test, app latency
-├── tests/test_ai.py         # Phase 5: RL guardrails, DP vs myopic, write-down accounting, review leakage
+│   ├── webexport.py         # Phase 6: builds the app + website from the artifacts (incl. PPO weights, scenario draws, forecasts, reviews)
+│   ├── api.py               # Phase 6: optional Python reference server (FastAPI): same page + JSON engine endpoints
+│   └── pipeline.py          # batch orchestration of Phases 1-6 + reports/results.md writer
+├── brand/capi/              # Capi artwork exported from the app code: 5 poses + logo, SVG (font embedded) + transparent PNG,
+│                            #   in two inks: for-dark-backgrounds/ and for-light-backgrounds/ (posters, slides)
+├── brand/qr/                # Poster QR codes for operator-x.github.io/margem (Capi in the centre, error correction H, decode-verified)
+├── brand/make_qr.py         # regenerates the QR codes;  brand/render_capi.js re-exports the Capi artwork
+├── web/                     # Phase 6: the Margem app
+│   ├── template.html        #   design, UI logic and the in-browser ENGINE block (data slot: __DATA__)
+│   ├── data.json            #   (generated) everything the page reads, ~0.5 MB
+│   ├── margem.html          #   (generated) self-contained app
+│   ├── site/                #   (generated) the public website: index.html, Capi favicon, .nojekyll
+│   └── publish.sh           #   rebuilds and pushes web/site/ to GitHub Pages (repo Operator-X/margem)
+├── tests/test_engine.py     # Phases 0-4 and 6: guardrails, leakage, Lerner test, server endpoints
+├── tests/test_ai.py         # Phase 5-6: RL guardrails, DP vs myopic, write-down, review leakage, lab-solver parity, web build
+├── tests/test_browser_engine.py  # Phase 6: in-browser optimiser and RL seasons vs the Python engine (run in Node)
 ├── data/labels/             # Phase 5C: cached LLM review labels (small, safe to commit)
 ├── data/raw/                # (downloaded) Olist CSVs + SELIC JSON
 ├── artifacts/               # (generated) parquet tables and the trained policy consumed by the app
@@ -178,16 +192,18 @@ finproj/
 | `panel.parquet` | 1 | SKU × week | Modelling panel with features, unit economics and customer-voice signals |
 | `forecasts.parquet`, `forecast_metrics.parquet` | 2 | SKU × week / model | Point forecasts per walk-forward origin; statistical and financial scorecard |
 | `elasticity_category.parquet`, `elasticity_sku.parquet` | 3 | category / SKU | DML elasticities with CIs and naive comparisons; shrunk, de-attenuated SKU elasticities |
+| `elasticity_robust.parquet` | 3 | category | Robustness check: DML on sale weeks only (outcome ln Q) |
 | `sku_state.parquet`, `recommendations.parquet` | 4 | live SKU / SKU × scenario × mode | Pricing state per SKU; precomputed portfolio recommendations |
 | `ppo_pricing.zip`, `rl_eval.parquet` | 5A | — / SKU × season × policy | Trained RL policy; out-of-sample policy comparison |
 | `prob_forecasts.parquet`, `prob_metrics.parquet` | 5B | SKU × week × model / model | Quantile forecasts; probabilistic and newsvendor scorecard |
+| `chronos_quantiles.parquet` | 5B | SKU × week × model | Raw Chronos output from its separate PyTorch process |
 | `review_labels.parquet`, `elasticity_voice.parquet`, `moderation.parquet` | 5C | review / category / moderator | LLM labels; DML with review confounders; heterogeneity tests |
 
 ---
 
 ## 5. Phase 0: financial invariants and engineering rules
 
-All parameters live in `engine/config.py` (`FinanceParams`), so the pipeline, the dashboard and the report can never disagree.
+All parameters live in `engine/config.py` (`FinanceParams`), so the pipeline, the Margem app and the report can never disagree.
 
 ### Financial invariants (enforced in code and checked by tests)
 
@@ -211,10 +227,10 @@ All parameters live in `engine/config.py` (`FinanceParams`), so the pipeline, th
 - **Reproducibility.**
   - `SEED = 42` for numpy, LightGBM (`deterministic=True`), PyTorch/PPO, the optimiser's uncertainty draws and the RL evaluation scenarios.
   - LLM labels are cached, so results never depend on re-querying a model.
-- **Latency.** The dashboard never refits a model. One pricing interaction re-solves a single SKU's 1-D price problem in about 10 ms.
+- **Latency.** Margem never refits a model. A live pricing request re-solves one SKU's 1-D price problem and its 200 uncertainty draws on the server in tens of milliseconds (asserted < 200 ms by a test).
 - **Process isolation.** PyTorch (Chronos, PPO) and LightGBM ship different OpenMP runtimes, and on macOS combining them in one process segfaults or deadlocks. So:
   - the pipeline runs the PyTorch stages as separate processes;
-  - the dashboard never imports LightGBM;
+  - the Margem server never imports LightGBM;
   - the app test runs in its own subprocess.
 
 ---
@@ -283,7 +299,7 @@ DSI (days) = inventory / weekly units · 7
 | telephony | R$ 29.99 | R$ 15.10 | **−R$ 12.01** | 92% |
 | watches_gifts | R$ 119.00 | R$ 15.90 | R$ 34.42 | 7% |
 
-Low-ticket electronics are **structurally CM2-negative** when the seller absorbs freight. A R$30 phone accessory carries about R$15 of freight against a 20% gross margin. The dashboard's "freight borne by seller" slider shows how this flips when the customer pays shipping.
+Low-ticket electronics are **structurally CM2-negative** when the seller absorbs freight. A R$30 phone accessory carries about R$15 of freight against a 20% gross margin. Margem's "shipping paid by seller" slider (Scenario lab, and Simulate on any product) shows how this flips when the customer pays shipping.
 
 ---
 
@@ -441,7 +457,7 @@ With Π = Q(P)·(aP − c), where a = 1 − fee and c = COGS + s·F, and constan
 dΠ/dP < 0   ⇔   |ε| > aP / (aP − c) = 1 / m,     m = CM2 / net revenue
 ```
 
-A price cut adds CM2 **only if demand is more elastic than 1/m**. If CM2 ≤ 0, no elasticity makes a cut profitable. `finance.breakeven_elasticity()` computes this threshold for every SKU; the dashboard shows it, and a test checks it against the numerical gradient.
+A price cut adds CM2 **only if demand is more elastic than 1/m**. If CM2 ≤ 0, no elasticity makes a cut profitable. `finance.breakeven_elasticity()` computes this threshold for every SKU; Margem shows it in every "why this price" note, and a test checks it against the numerical gradient.
 
 ### 9.8 Scope of Phase 4
 
@@ -533,35 +549,110 @@ Results: §12.6.
 
 ---
 
-## 11. Phase 6: interactive dashboard
+## 11. Phase 6: Margem, the product
 
-`app.py` → `uv run streamlit run app.py`
+Phase 6 turns the engine into something a seller would open every Monday, and that a judge can understand in 30 seconds. **Where it runs:** **https://operator-x.github.io/margem/** (the poster QR code), or `web/site/index.html` offline. Every feature works there with no server, because the interactive parts of the engine are ported to JavaScript and parity-tested against Python (§11.6). Optionally, `uv run python -m engine.api` serves the same page from a FastAPI server, and then the Scenario lab also confirms its numbers with the Python optimiser.
 
-The app reads only precomputed artifacts (`st.cache_data`; the PPO policy via `st.cache_resource`). A pricing interaction re-solves one SKU's price problem and its 200 uncertainty draws in about **10 ms**; this is displayed in the footer and asserted below 200 ms by a test.
+**Design rule: simple first, more on request.** Every screen opens with one sentence, one number and Capi. Detail appears only when asked for: cards expand into panels; a product page opens three tools (Simulate, Forecast, What buyers say); the Season planner offers "Race the AI on any product".
 
-**Sidebar controls (shared by all tabs)**
-- Category, and a SKU picker labelled with its elasticity and forecast weekly units.
-- Current inventory (default: 4 weeks of forecast supply).
-- WACC / cost-of-capital slider, 5–20% (default: SELIC in the decision week, 6.5%); the 6% storage spread is added on top.
-- Strategy toggle: *Margin Maximization (EBITDA)* or *Aggressive Cash Recovery (Liquidity)*.
-- Expander with the platform fee and the share of freight borne by the seller.
+### 11.1 Identity
 
-| Tab | Phase | Content |
+- **Name.** *Margem* is Portuguese for "margin", a double meaning that drives the whole design. Profit margin is what the engine protects, and the analysis is written as handwritten *notes in the margin*. Tagline: **"Notes in the margin. Money in the margin."**
+- **Mascot: Capi the capybara**, Brazil's best-known animal, hand-drawn with rough.js and redrawn stroke by stroke each time a page opens. Capi has one pose per page:
+
+  | Page | Pose | Says |
+  |---|---|---|
+  | Overview | holding a "+15%" price tag | *"psst… they won't notice"* |
+  | Products | asleep on a box of unsold stock | *"napping on unsold stock"* |
+  | Season planner | with a calendar | *"I plan the whole season"* |
+  | Evidence | in a detective hat with a magnifying glass | *"Black Friday fooled them!"* |
+  | Scenario lab | soaking in a hot tub of rates | *"rates up? I'll just soak here"* |
+
+- **Look.** Three ingredients:
+  - **Linear-style dark minimalism** as the base;
+  - **Stripe-style live cards** that animate in and expand into full detail panels when clicked;
+  - **Notion-style hand-drawn ink** (Caveat handwriting, sketched underlines, arrows and margin notes) on a dot-grid notebook background with a red margin rule.
+- **Voice.** Plain English with a little Portuguese ("**Bom dia.**"). Every headline is one sentence with one hand-underlined number.
+- **Sketches toggle.** A sidebar switch hides the doodles and notes for a clean, formal view.
+
+### 11.2 Pages
+
+Every page follows the same formula: a one-sentence headline with an underlined number, Capi, then animated cards that open into detail panels.
+
+| Page | Phase | Headline (live data) | Content |
+|---|---|---|---|
+| **Overview** | 4 | *"You could earn R$618 more this week."* | Four 2-up live cards (weekly CM2 with a "next week" projection, cash in stock, forecast error, RL uplift); "3 things to do this week" with Approve flows |
+| **Products** | 1, 4 | *"R$7,362 is stuck in products that lose money."* | Capital-traps and cash-machines cards; the capital map (margin × weekly sales × cash), annotated by hand |
+| **Season planner** | 5A | *"Planning ahead turns a −R$204 season into R$62 profit."* | **Season replay** of one real lot over 26 weeks, comparing holding the price, the weekly optimiser and the AI planner on identical demand, with a live scoreboard and a closing verdict; out-of-sample policy chart and table |
+| **Evidence** | 2, 3, 5B | *"A naive model thinks discounts work 2.9× better than they do."* | Naive vs Double-ML bars by category; forecast-error and GenAI-capital cards |
+| **Scenario lab** | 4, 0 | *"At SELIC 15.00% with 20 weeks of stock, the engine cuts 13 prices…"* | Rate presets (Brazil 2016: 14.25%, 2018: 6.50%, 2025: 15.00%); sliders for stock, platform fee and seller-paid shipping; goal toggle (this week's profit or cash recovery). All 72 products re-price live in the browser, using the Phase 4 objective and the Phase 0 guardrails |
+
+**Throughout:** ⌘K search jumps to any product; each product page shows the recommended price, 26 weeks of sales and a plain-English "why this price".
+
+**Product names:** Olist has no product names, so they are generated from the category and weight, e.g. *"Bed & bath set · 850 g #704e"*.
+
+### 11.3 Motion
+
+- **Cards** count up and draw their charts when they first scroll into view; detail panels open from the card that was clicked.
+- **Scroll-driven reveals:** sections rise in, and page headers drift back as you scroll.
+- **Capi and the hand-drawn notes** sketch themselves in.
+
+Motion follows `prefers-reduced-motion`, and every page is complete without it: content is never hidden waiting for an animation.
+
+### 11.4 Build and sharing
+
+- **Build:** `engine/webexport.py` reads the Phase 1–5 artifacts, generates the product names, and computes the season replay in a PyTorch child process (process-isolation rule). It writes `web/data.json` (about 27 KB) and injects it into `web/template.html`, producing **one self-contained file** that works offline on a laptop.
+- **Representative replay:** the season replay uses the demand scenario whose AI-vs-hold gap is closest to the mean over 60 scenarios, so the demo is representative rather than lucky.
+- **Hosting:** `web/site/` is the standalone website (full HTML document, Capi favicon, link-preview tags). `web/publish.sh` copies only those files into a separate public repo (`Operator-X/margem`) served by GitHub Pages at **https://operator-x.github.io/margem/**. No code or data beyond the page is published.
+- **Poster QR codes:** `brand/qr/` holds light and dark versions pointing at that URL (Capi in the centre, error correction H, 4-module quiet zone), verified to decode at sizes from 15% to 100%. The URL never changes, so republishing never invalidates them.
+
+### 11.5 The optional Margem server (`engine/api.py`)
+
+Not needed to use Margem; it is the Python reference that serves the same page and exposes the engine as JSON (useful for demos on the laptop and as a second implementation):
+
+| Endpoint | Phase | Used by | Typical time |
+|### 11.6 The in-browser engine, and how we know it is faithful
+
+The interactive features run in the visitor's browser (the `ENGINE` block of `web/template.html`), so the public site needs no server, works offline, and never cold-starts:
+
+| Browser feature | Ported from | How it is made identical |
 |---|---|---|
-| **Pricing simulator** | 4 | KPI cards (recommended price, CM2 gain, DSI change, working capital freed); causal ε, Lerner breakeven, feasible band and P* interval with guardrail flags; "causal sweet spot" profit and demand curves with 90% uncertainty bands; P&L waterfall |
-| **RL agent** | 5A | Weeks-of-supply, elasticity-surprise and scenario controls; expected NPV, sell-through and price per policy over 40 shared demand scenarios; price and stock paths for one illustrative scenario; the out-of-sample shortfall-to-oracle chart |
-| **GenAI forecast** | 5B | Per-model scorecards (WQL, fill rate, inventory capital, calibration); fan chart of q10–q90 vs actuals for the selected SKU; the full probabilistic and newsvendor table |
-| **Customer voice** | 5C | Theme prevalence by category; DML with vs without review confounders; moderation results; the selected SKU's latest reviews with their LLM tags |
-| **Portfolio** | 4 | Precomputed recommendations for all 72 live SKUs under 2 inventory scenarios × 2 strategy modes |
-| **Model evidence** | 2–3 | Naive OLS vs Double-ML elasticities with 95% intervals; the point-forecast financial scorecard |
+| Simulate, Scenario lab | `engine/optimize.py` (bounds, profit, 401-point grid + local refinement, uncertainty band) | The 200 elasticity draws are numpy's seeded draws, shipped with the page |
+| Race the AI | `engine/rl.py` (lattice, guardrails, demand, Bayesian elasticity belief, write-down, exact DP) | Negative-binomial pmf/survival/quantile in closed form for dispersion 3; each scenario's uniform draws shipped with the page |
+| The AI agent | The trained PPO network (12→128→128→5, tanh) | Weights exported from the trained model; observations rounded to float32 as in PyTorch |
+| Forecast, What buyers say | `prob_forecasts.parquet`, `review_labels.parquet` | Exported per product into the page |
 
-**Demo path for judges.**
-1. **Pricing simulator:** show the Lerner test, then raise WACC and inventory with the liquidity mode on to watch cuts appear.
-2. **RL agent:** pick bed_bath_table SKU `704ef63a` with 40 weeks of supply, where planning ahead beats the one-week optimiser.
-3. **GenAI forecast:** compare inventory capital across the models.
-4. **Customer voice:** show the confounding shift.
+**Parity tests** (`tests/test_browser_engine.py`, `tests/test_ai.py`) run the browser code in Node and the Python engine on identical inputs:
+- the optimiser agrees on price, profit, carrying cost, flags and the uncertainty band to within R$0.01–0.02;
+- whole RL seasons (5 strategies × several products, stock levels and demand surprises, including the neural agent) produce **identical week-by-week stock paths** and profits within R$0.10;
+- the Scenario lab matches across 4 scenarios × 72 products.
 
-Colours follow a validated, colour-blind-checked reference palette. Each policy, model and category keeps a fixed colour across all tabs, and green and red are reserved for good and bad outcomes.
+Page weight: about 0.5 MB of data (half of it the network's weights).
+
+---|---|---|---|
+| `POST /api/price` | 4 | Product → **Simulate**: stock, cost of capital, goal, fee and seller-paid shipping sliders; best price, profit curve with 90% band, P&L bridge, "why this price" | ~50 ms |
+| `POST /api/season` | 5A | Season planner → **Race the AI on any product**: hold / weekly optimiser / exact planner / PPO agent / oracle on one shown season plus 40-scenario averages, replayed with the same animation | ~2 s |
+| `GET /api/forecast/{sku}` | 5B | Product → **Forecast**: q10–q90 range vs actual units for LightGBM and both Chronos models | instant |
+| `GET /api/reviews/{sku}` | 5C | Product → **What buyers say**: latest reviews with their LLM theme tags | instant |
+| `POST /api/portfolio` | 4 | **Scenario lab**: re-prices all 72 products under the chosen SELIC, stock, fee, shipping and goal | ~70 ms |
+
+Interactive API docs are at `/api/docs`. The server loads PyTorch for the PPO agent, so under the process-isolation rule it never imports LightGBM. Static extras that need no server are built into the page:
+- **Evidence → Show the statistics:** the Phase 3 table (Double ML with 95% CIs, naive within-SKU and pooled OLS, the sale-weeks-only robustness check, observations and SKUs), plus CI whiskers on the chart.
+- **Evidence → forecast card:** the full Phase 2 and 5B scorecard (RMSE, MAE, WAPE, bias, stockout loss, excess holding, safety-stock capital; quantile loss, 80% and 90% calibration, fill rate, stock capital, working capital at risk).
+- **Evidence → Customer voice:** themes by category, the with/without-review elasticities per category with CIs, and the moderation table with its Bonferroni verdict.
+- **Products → See all 72 products** (a sortable table) and **Batch scenarios** (the pipeline's 4 vs 12 weeks × goal totals).
+- **Product page:** the elasticity regime, its 95% range, and a flag when the product's own estimate had the wrong sign and fell back to its category.
+- **Race the AI** (live): a five-strategy results table and the value of knowing the true elasticity (oracle minus the best realistic strategy).
+
+**Scenario lab engine.** The lab runs the in-browser port of `engine/optimize.py` (same bounds, profit, 401-point grid and local refinement) and labels itself that way on screen; when the page is served by the optional Python server it also confirms each scenario with `/api/portfolio`. A parity test runs that port in Node against Python on 4 scenarios × 72 products: every price agrees within R$0.01.
+
+---|---|---|
+| Pricing simulator | 4 | KPI cards, causal ε and Lerner breakeven, guardrail flags, profit and demand curves with 90% bands, P&L waterfall |
+| RL agent | 5A | Expected NPV per policy over 40 shared scenarios, illustrative price and stock paths, shortfall-to-oracle chart |
+| GenAI forecast | 5B | Scorecards, q10–q90 fan chart per SKU, the newsvendor table |
+| Customer voice | 5C | Theme prevalence, DML with vs without review confounders, moderation, the latest tagged reviews |
+| Portfolio | 4 | Recommendations for all 72 live SKUs under 2 scenarios × 2 modes |
+| Model evidence | 2–3 | Naive vs Double-ML elasticities, the point-forecast scorecard |
 
 ---
 
@@ -683,7 +774,7 @@ Controlling for perception makes demand about 30% more price-sensitive overall, 
 
 ## 13. Tests
 
-`uv run pytest`: 36 tests, about 9 s.
+`uv run pytest`: 40 tests, about 9 s.
 
 | Test | Phase | What it guarantees |
 |---|---|---|
@@ -696,7 +787,11 @@ Controlling for perception makes demand about 30% more price-sensitive overall, 
 | `test_dp_dominates_myopic_in_expectation` | 5A | Over 300 shared demand scenarios, the exact DP earns at least the myopic policy's NPV |
 | `test_unsold_stock_books_a_writedown` | 5A | Unsold stock costs (1 − salvage)·COGS, never a phantom gain |
 | `test_review_features_are_leakage_safe` | 5C | A review becomes visible only the week after it is written |
-| `test_app_runs_and_solves_fast` | 6 | All six tabs run headless (Streamlit `AppTest`, in a subprocess) without exceptions; a WACC change re-solves in under 200 ms |
+| `test_margem_server_endpoints` | 6 | The optional Python server serves the page; `/api/price` respects the floor and band and answers in under 200 ms; `/api/season` returns full 26-week paths; `/api/portfolio` re-prices all 72 products; unknown products return 404 (run in a subprocess) |
+| `test_lab_solver_matches_python_optimiser` | 6 | The Scenario lab's in-browser solver matches `engine.optimize.optimise` to within R$0.01 on every product across 4 scenarios (run in Node) |
+| `test_price_matches_python` | 6 | The browser optimiser (Simulate) equals `engine.optimize.optimise` on price, profits, flags and uncertainty band, across products, stock levels, rates, goals, fees and shipping |
+| `test_season_matches_python` | 6 | Browser RL seasons equal `engine.rl` (hold, weekly, exact planner, PPO agent, oracle): identical stock paths, profits within R$0.10 (Python side in a subprocess) |
+| `test_web_app_build_is_consistent` | 6 | The Margem template has exactly one data slot; every price shipped to the web app respects the margin floor and ±15% band; the season replay covers all 26 weeks |
 
 ---
 
@@ -718,12 +813,14 @@ Controlling for perception makes demand about 30% more price-sensitive overall, 
 | Probabilistic evaluation | Newsvendor backtest at q90 + Working-Capital-at-Risk | Converts calibration into balance-sheet terms |
 | LLM labelling | Batched Claude Haiku calls, cached labels, star-rating validation | Cheap, reproducible, independently checked |
 | Process isolation | PyTorch stages in separate processes | PyTorch and LightGBM cannot share a macOS process |
+| Product front end | One self-contained Margem page with the interactive engine ported to JavaScript and parity-tested against Python; an optional FastAPI server as the Python reference | Judges scan a QR code on conference Wi-Fi: nothing may sleep, cold-start or time out, yet every number must be provably the Python engine's |
+| Visual identity | Capi the capybara, handwritten margin notes, dark notebook UI | Memorable for judges, rooted in the Brazilian data, and the "margin notes" carry the explanations |
 
 ---
 
 ## 15. Limitations and honest caveats
 
-1. **COGS is synthesised** from sector benchmarks, not observed. Every CM2 figure inherits this assumption, which is why the dashboard exposes the fee and freight assumptions as sliders.
+1. **COGS is synthesised** from sector benchmarks, not observed. Every CM2 figure inherits this assumption, which is why Margem exposes the fee and shipping assumptions as sliders.
 2. **Freight treatment matters a lot.** The CM2 definition charges the full freight to the seller; on Olist the customer often pays it. With seller freight share = 0, electronics are no longer CM2-negative.
 3. **Elasticities are short-run and weekly.** They do not capture competitor responses, search-ranking penalties, or customers switching to rival listings of the same product after a sustained price increase. The +15% recommendations are therefore **model-implied upper bounds** inside the volatility band, not forecasts of realised profit.
 4. **Sparse demand.** The typical SKU averages about 1 unit a week over its listing. Half of the 72 live SKUs hit the forecast floor of 0.2 units a week, so their R$ figures are small and uncertain.
@@ -761,3 +858,4 @@ Controlling for perception makes demand about 30% more price-sensitive overall, 
 | **WQL** | Weighted quantile loss: average pinball loss over the q10/q50/q90 quantiles, scaled by total demand |
 | **Working-Capital-at-Risk (90%)** | Σ(q90 − q50)·COGS: capital needed to move from a 50% to a 90% in-stock rate |
 | **Moderation** | Interaction showing how the price effect changes with another variable |
+| **Margem** | Portuguese for "margin"; the product name of the Phase 6 web app |

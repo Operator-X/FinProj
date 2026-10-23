@@ -70,3 +70,59 @@ def test_review_features_are_leakage_safe():
     assert out.loc["2018-01-08", "voice_n"] == 0
     assert out.loc["2018-01-15", "voice_n"] == 1
     assert out.loc["2018-01-15", "voice_price_high"] == 1.0
+
+
+def test_web_app_build_is_consistent():
+    """Phase 6: the page has one data slot and every shipped price respects the guardrails."""
+    import json
+
+    from engine.config import FIN, ROOT
+    web = ROOT / "web"
+    tpl = (web / "template.html").read_text()
+    assert tpl.count("__DATA__") == 1
+    if not (web / "data.json").exists():
+        pytest.skip("run engine.webexport first")
+    d = json.loads((web / "data.json").read_text())
+    assert {"skus", "weekly", "prob", "point", "rl", "dml", "replay"} <= d.keys()
+    for s in d["skus"]:
+        floor = FIN.floor_normal * s["cogs"]
+        assert s["pstar"] >= min(floor, (1 + FIN.band) * s["price"]) - 0.02
+        assert s["pstar"] <= max((1 + FIN.band) * s["price"], floor) + 0.02
+    assert len(d["replay"]["paths"]["agent"]["price"]) == H
+
+
+SCENARIOS = [dict(selic=6.5, wos=4, fee=10, fr=100, goal="profit"),
+             dict(selic=15.0, wos=20, fee=10, fr=100, goal="cash"),
+             dict(selic=14.25, wos=30, fee=5, fr=0, goal="cash"),
+             dict(selic=2.0, wos=9, fee=20, fr=50, goal="profit")]
+
+
+def test_lab_solver_matches_python_optimiser():
+    """Phase 6: the Scenario lab's in-browser solver is an exact port of engine.optimize."""
+    import json
+    import math
+    import shutil
+    import subprocess
+    from dataclasses import replace
+
+    from engine.config import ROOT
+    from engine.optimize import SkuInputs, optimise
+    if shutil.which("node") is None or not (ROOT / "web" / "data.json").exists():
+        pytest.skip("needs node and web/data.json")
+    tpl = (ROOT / "web" / "template.html").read_text()
+    js = tpl[tpl.index("/* LAB-SOLVER-START"):tpl.index("/* LAB-SOLVER-END */")]
+    data = json.loads((ROOT / "web" / "data.json").read_text())
+    script = f"const D = {json.dumps({'skus': data['skus']})};\n{js}\nconsole.log(JSON.stringify({json.dumps(SCENARIOS)}.map(solveLab)));"
+    js_out = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+    for p, j in zip(SCENARIOS, js_out):
+        fin = replace(FIN, platform_fee=p["fee"] / 100, freight_share=p["fr"] / 100)
+        goal = "liquidity" if p["goal"] == "cash" else "margin"
+        opt_total = 0.0
+        for s in data["skus"]:
+            x = SkuInputs(p_last=s["price"], q_base=s["q"], eps=s["eps"], eps_se=s["se"], cogs=s["cogs"],
+                          freight=s["fr"], inventory=float(math.ceil(p["wos"] * s["q"])),
+                          annual_hold_rate=p["selic"] / 100 + fin.storage_spread)
+            d = optimise(x, goal, fin, n_draws=5)
+            assert abs(d.p_star - j["prices"][s["id"]]) < 0.01, (p, s["id"], d.p_star, j["prices"][s["id"]])
+            opt_total += d.profit_star
+        assert abs(opt_total - j["opt"]) < 1.0

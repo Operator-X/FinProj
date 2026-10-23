@@ -62,28 +62,36 @@ def test_forecast_features_do_not_leak_current_sales():
     assert f["seller_count_lag1"].iloc[2] == 1
 
 
-APP_CHECK = """
+API_CHECK = """
 import time
-from streamlit.testing.v1 import AppTest
-at = AppTest.from_file("app.py", default_timeout=120).run()
-assert not at.exception, at.exception
-at.sidebar.slider[0].set_value(18.0)
-at.run()
-assert not at.exception, at.exception
-solve = [c.value for c in at.caption if "Solve + curve evaluation" in c.value][0]
-print(float(solve.split(":")[1].split("ms")[0]))
+from fastapi.testclient import TestClient
+from engine.api import app
+c = TestClient(app)
+assert c.get("/api/health").json()["ok"]
+page = c.get("/").text
+assert "window.MARGEM_LIVE = true" in page and page.count("const D = ") == 1
+t0 = time.perf_counter()
+r = c.post("/api/price", json={"sku": "704ef63a", "wacc": 0.12, "goal": "liquidity"}).json()
+ms = (time.perf_counter() - t0) * 1000
+assert r["p_lo"] - 1e-6 <= r["p_star"] <= r["p_hi"] + 1e-6 and r["p_star"] >= r["floor"] - 1e-6
+assert len(r["curve"]["p"]) == len(r["curve"]["pi"]) == 121
+s = c.post("/api/season", json={"sku": "704ef63a", "wos": 20, "scenarios": 5}).json()
+assert set(s["paths"]) >= {"hold", "weekly", "agent"} and all(len(v["price"]) == len(v["inv"]) == 26 for v in s["paths"].values())
+assert c.post("/api/price", json={"sku": "nope"}).status_code == 404
+pf = c.post("/api/portfolio", json={"wacc": 0.15, "wos": 20, "goal": "liquidity"}).json()
+assert pf["up"] + pf["cut"] + pf["hold"] == 72 and len(pf["prices"]) == 72
+print(ms)
 """
 
 
 @pytest.mark.skipif(not PATHS.sku_state.exists(), reason="run engine.pipeline first")
-def test_app_runs_and_solves_fast():
-    # Separate process: the app loads torch (PPO), which must not share a
+def test_margem_server_endpoints():
+    # Separate process: the server loads torch (PPO), which must not share a
     # process with the LightGBM already imported by this test session.
     import subprocess
     import sys
 
     from engine.config import ROOT
-    out = subprocess.run([sys.executable, "-c", APP_CHECK], cwd=ROOT, capture_output=True, text=True,
-                         timeout=300)
+    out = subprocess.run([sys.executable, "-c", API_CHECK], cwd=ROOT, capture_output=True, text=True, timeout=300)
     assert out.returncode == 0, out.stderr[-2000:]
     assert float(out.stdout.strip().splitlines()[-1]) < 200
