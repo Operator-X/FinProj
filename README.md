@@ -19,10 +19,11 @@ It is built on the public Olist dataset (about 100k Brazilian orders, 2016–201
 8. [Phase 4: constrained price optimisation](#8-phase-4-constrained-price-optimisation)
 9. [Phase 5: the interactive dashboard](#9-phase-5-the-interactive-dashboard)
 10. [Results](#10-results)
-11. [Tests](#11-tests)
-12. [Deviations from the original specification](#12-deviations-from-the-original-specification)
-13. [Limitations and honest caveats](#13-limitations-and-honest-caveats)
-14. [Glossary](#14-glossary)
+11. [AI extensions: RL agent, GenAI forecasting, LLM review mining](#11-ai-extensions-rl-agent-genai-forecasting-llm-review-mining)
+12. [Tests](#12-tests)
+13. [Deviations from the original specification](#13-deviations-from-the-original-specification)
+14. [Limitations and honest caveats](#14-limitations-and-honest-caveats)
+15. [Glossary](#15-glossary)
 
 ---
 
@@ -41,15 +42,21 @@ uv run kaggle datasets download -d olistbr/brazilian-ecommerce -p data/raw --unz
 curl -s 'https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados?formato=json&dataInicial=01/09/2016&dataFinal=31/10/2018' \
      -o data/raw/selic_432.json
 
-# 2) Batch pipeline: Phases 1-4 (~75 s on an M-series Mac)
-uv run python -m engine.pipeline          # -> artifacts/*.parquet, reports/results.md
+# 2) LLM review labels (once; labels are cached in data/labels/, resumable)
+uv run python -m engine.reviews           # ~35 batched `claude -p --model haiku` calls
 
-# 3) Dashboard: Phase 5
+# 3) Batch pipeline: all phases + AI extensions (~4 min; first run also trains the RL agent)
+uv run python -m engine.pipeline          # -> artifacts/*.parquet, reports/results.md
+uv run python -m engine.rl train eval     # optional: retrain the PPO agent (~4.5 min) and re-evaluate
+
+# 4) Dashboard
 uv run streamlit run app.py               # http://localhost:8501
 
-# 4) Tests
-uv run pytest                             # 29 tests
+# 5) Tests
+uv run pytest                             # 36 tests
 ```
+
+The first pipeline run downloads two Chronos foundation models from Hugging Face (`amazon/chronos-bolt-small`, `amazon/chronos-2`). Step 2 needs the Claude Code CLI; without labels, the review stage is skipped and everything else still runs.
 
 If `selic_432.json` is missing, the engine falls back to a hard-coded table of the COPOM rate decisions (see `engine/finance.py`), so the pipeline still runs offline.
 
@@ -90,9 +97,14 @@ finproj/
 │   ├── forecast.py          # Phase 2: 3 forecasters, walk-forward CV, financial scorecard
 │   ├── elasticity.py        # Phase 3: fixed-effects Double ML + SKU shrinkage
 │   ├── optimize.py          # Phase 4: constrained price optimiser + uncertainty band
+│   ├── rl.py                # AI: sell-through simulator, exact DP, PPO agent, Bayesian elasticity learning
+│   ├── foundation.py        # AI: Chronos foundation models vs LightGBM quantiles, newsvendor backtest
+│   ├── reviews.py           # AI: LLM review coding (Claude) -> leakage-safe customer-voice features
 │   └── pipeline.py          # batch orchestration + reports/results.md writer
-├── app.py                   # Phase 5: Streamlit simulator (reads artifacts only)
+├── app.py                   # Streamlit app: 6 tabs (reads artifacts only)
 ├── tests/test_engine.py     # guardrail invariants, leakage test, Lerner test, app latency
+├── tests/test_ai.py         # RL guardrails, DP vs myopic, write-down accounting, review leakage
+├── data/labels/             # cached LLM review labels (small, safe to commit)
 ├── artifacts/               # (generated) parquet tables consumed by the app
 ├── reports/results.md       # (generated) every number in this README, regenerated each run
 ├── data/raw/                # (downloaded) Olist CSVs + SELIC JSON
@@ -110,6 +122,10 @@ finproj/
 | `elasticity_sku.parquet` | SKU | Raw, shrunk and de-attenuated elasticities, regime label |
 | `sku_state.parquet` | live SKU | Everything needed to price a SKU in the decision week |
 | `recommendations.parquet` | SKU × scenario × mode | Precomputed portfolio recommendations |
+| `prob_forecasts.parquet`, `prob_metrics.parquet` | SKU × week × model / model | Quantile forecasts (Chronos, LightGBM) and their financial scorecard |
+| `review_labels.parquet` | review | LLM-coded themes and sentiment per review |
+| `elasticity_voice.parquet`, `moderation.parquet` | category / moderator | DML with review confounders; heterogeneity by perception |
+| `ppo_pricing.zip`, `rl_eval.parquet` | — / SKU × season × policy | Trained RL policy; out-of-sample policy comparison |
 
 ---
 
@@ -458,9 +474,123 @@ After de-attenuation and shrinkage, the median SKU elasticity is −1.61 (bed_ba
 
 ---
 
-## 11. Tests
+## 11. AI extensions: RL agent, GenAI forecasting, LLM review mining
 
-`uv run pytest`: 29 tests, about 2 s.
+Each extension fixes a specific weakness of the core engine and is judged with the same financial lens.
+
+### 11.1 Reinforcement-learning pricing agent (`engine/rl.py`)
+
+**Weakness addressed.** The Phase-4 optimiser is myopic: it only maximises *this week's* profit. A real seller holding a lot of stock faces a *sequence* of prices: hold the price high and risk being stuck with stock, or discount and give margin away?
+
+**The problem the agent solves.**
+- **Season:** a fixed lot of stock, a 26-week season and no replenishment.
+- **Leftover stock:** anything unsold at the end goes to an outlet at 50% of cost. That is booked as a write-down of 50% of COGS, consistent with CM2, which already charges COGS on each unit sold.
+- **Price moves:** each week the price moves on a lattice P0·√1.15^k, at most two steps (±15%) per week.
+- **Price limits:** the margin floor always applies (relaxed to break-even once stock is aged). Prices are capped at +42%, the edge of the range in which elasticity was identified.
+- **Demand:** negative binomial with mean q_base·(P/P0)^ε and dispersion 3, matching the lumpy weekly counts in the data.
+- **Reward:** CM2 on units sold − SELIC-linked carrying cost − the end-of-season write-down, discounted at the weekly SELIC.
+- **Learning while earning:** the true ε is drawn from the Double-ML posterior and is *not* shown to the agent. The environment keeps an exact Bayesian posterior over ε on a grid, updated each week from observed sales, and correctly handles weeks where the agent sold out, because then demand was higher than the sales it saw. The agent sees the posterior mean and std, so trying a price to learn from the response has value it can discover.
+
+**The agent.**
+- **Algorithm and network:** one PPO policy (stable-baselines3, a 2×128 MLP) prices *every* SKU in the catalogue.
+- **What it sees:** stock, time left, current price level, its elasticity belief, margin structure, cost of capital and recent sales.
+- **Training:** 2M steps, about 4.5 minutes on a Mac CPU.
+- **Training variety:** SKUs are sampled evenly across elasticity regimes (highly elastic SKUs are rare but matter most). SELIC is drawn from 6.5–15% and stock from 4–52 weeks of supply.
+
+**Benchmarks.** Every policy is run on identical demand scenarios (common random numbers): 72 SKUs × 30 seasons, SELIC 6.5%.
+
+| Policy | What it is |
+|---|---|
+| status quo | hold today's price all season |
+| myopic (Phase 4) | the core engine, re-solved each week |
+| CE-DP | exact dynamic programme that treats the estimated ε as true |
+| **PPO agent** | the RL policy |
+| oracle DP | exact DP that *knows* the true ε, an upper bound in expectation |
+
+**Results** (mean season NPV per lot in R$; shortfall vs oracle in brackets):
+
+| Stock regime | Status quo | Myopic | CE-DP | **PPO** | Oracle |
+|---|---|---|---|---|---|
+| lean (< 13 wks supply) | 75.8 (−250.9) | 322.0 (−4.7) | 325.9 (−0.8) | **326.2 (−0.6)** | 326.7 |
+| full (13–26 wks) | 111.5 (−393.1) | 493.4 (−11.1) | 499.7 (−4.9) | **497.9 (−6.7)** | 504.6 |
+| overstock (> 26 wks) | −203.8 (−287.2) | 58.6 (−24.8) | 61.8 (−21.6) | **61.8 (−21.7)** | 83.4 |
+
+**Reading.**
+1. **One network nearly matches the exact optimum.** A single network for the whole catalogue matches the exact DP on lean and overstocked lots and is within R$2 per lot on full ones. It beats the myopic engine in every regime. The DP needs a known model and a small state space, while the network scales to richer state.
+2. **The price of not knowing ε.** With overstock, even the best realistic policy leaves about **R$22 per lot (≈ 26% of NPV)** below the oracle. That gap is the value of perfect elasticity information, i.e. an upper bound on what a price experiment is worth.
+3. **Holding today's price is ruinous when overstocked.** It turns a +R$62 season into a −R$204 one.
+4. **Iteration history.** The first agent (600k steps, uniform SKU sampling) was weak on the 9 highly elastic SKUs (−R$15.8 vs CE-DP) and lost to the status quo on 3 SKUs. Balanced sampling and 2M steps cut that to −R$2.2 and 1 SKU. On 18 individual SKUs it still trails the myopic engine by small amounts, though it wins in aggregate.
+
+### 11.2 GenAI time-series foundation models vs LightGBM (`engine/foundation.py`)
+
+**Question.** Does a pretrained "GPT for time series" beat a model trained on our own data, and what does the answer mean for working capital?
+
+**Models**, all producing one-week-ahead q10/q50/q90 quantiles on the same walk-forward split as Phase 2:
+- **Chronos-Bolt-small** (zero-shot, univariate);
+- **Chronos-2** (zero-shot, with past/future covariates: posted log-price, holiday flags, truckers' strike, SELIC, category velocity);
+- **LightGBM quantile regression** (pinball loss), refit at each origin.
+
+**Financial test (newsvendor backtest).** Each week, stock up to ⌈q90⌉:
+- realised stockout margin loss;
+- excess carrying cost;
+- fill rate;
+- average inventory capital;
+- **Working-Capital-at-Risk (90%)** = Σ(q90 − q50)·COGS, the capital that buys the last 40 points of service level. This is only meaningful if q90 is calibrated, so coverage is reported too.
+
+| Model | WQL ↓ | WAPE (median) | P(sales ≤ q90) | Fill rate | Avg inventory capital / wk | WC-at-Risk 90 / wk |
+|---|---|---|---|---|---|---|
+| Chronos-Bolt (zero-shot) | 0.573 | 85.6% | 89% | 88.9% | R$ 27,915 | R$ 17,667 |
+| Chronos-2 + covariates (zero-shot) | 0.570 | 87.0% | 89% | 90.1% | R$ 27,845 | R$ 17,603 |
+| **LightGBM quantile** | **0.377** | **56.2%** | 92% | 88.0% | **R$ 19,667** | **R$ 9,037** |
+
+**Reading.**
+- On sparse, lumpy marketplace demand, the domain-trained model wins clearly.
+- The foundation models buy 1–2 points more fill rate by holding **about 40% more inventory capital** (R$8.2k a week more), because their intervals are wider.
+- Covariates and a cross-learning variant (batched by forecast week to stay leakage-safe; WQL 0.572) did not close the gap.
+- So GenAI is not free: its generality shows up on the balance sheet.
+
+### 11.3 LLM-coded customer voice in the causal model (`engine/reviews.py`)
+
+**Weakness addressed.** About 3.4k written Portuguese reviews of our SKUs were unused. Customer perception (quality, value, delivery) plausibly drives both demand and the seller's pricing, which would make it a hidden confounder.
+
+**Coding.**
+- **Model and taxonomy:** Claude (Haiku, via `claude -p`) codes each review into 9 themes plus a sentiment score in −1/0/1. The themes are value_good, price_high, quality_good, quality_bad, delivery_fast, delivery_late, wrong_or_missing, service_bad and recommend.
+- **Batching and caching:** 3,351 unique reviews in 34 batched calls. Labels are cached in `data/labels/review_labels.jsonl`, so results are reproducible without re-querying.
+- **Validation:** the LLM never saw the star ratings, yet its sentiment matches star polarity for **87.7%** of 1–2-star and 4–5-star reviews (95% of 1-star reviews coded negative, 93% of 5-star positive).
+
+**Leakage-safe features.**
+- At week t, a SKU "knows" only reviews created before t's Monday; a review written during week w is visible from w+1.
+- Shares are smoothed toward the catalogue mean with 5 pseudo-reviews.
+- Derived signal: `value_perception = value_good − price_high`.
+
+**Results.**
+
+| Category | DML θ | DML θ + review confounders |
+|---|---|---|
+| All | −0.34 | **−0.45** |
+| bed_bath_table | −0.57 | −0.50 |
+| computers_accessories | −0.18 | **−0.42** |
+| telephony | −0.11 | −0.07 |
+| watches_gifts | −0.54 | **−0.79** |
+
+- **Perception is a confounder.** Controlling for it makes demand about 30% more price-sensitive overall, and roughly 2× more for computer accessories. Customer perception had been pulling the estimates toward zero.
+- **Moderation** (the change in θ per 1 SD of each signal, SKU-clustered SEs, 4 tests so the Bonferroni threshold is |z| > 2.50):
+  - value perception: +0.11 (z = 1.33), the expected direction (good value → less price-sensitive) but not significant, because only about 3% of reviews discuss price at all;
+  - quality complaints: +0.17 (z = 2.25), not significant after the multiple-testing correction.
+- **Pricing still uses the original elasticities.** The review-adjusted estimates are reported as an extension. Adopting them would make the engine somewhat more cautious about price rises.
+
+### 11.4 Engineering note: PyTorch and LightGBM on macOS
+
+PyTorch (Chronos, PPO) and LightGBM ship different OpenMP runtimes, and on macOS combining them in one process segfaults or deadlocks. The code therefore keeps them apart:
+- the pipeline runs Chronos and the RL agent as **separate processes**;
+- the Streamlit app never imports LightGBM;
+- the app test runs in its own subprocess.
+
+---
+
+## 12. Tests
+
+`uv run pytest`: 36 tests, about 9 s.
 
 | Test | What it guarantees |
 |---|---|
@@ -469,11 +599,15 @@ After de-attenuation and shrinkage, the median SKU elasticity is −1.61 (bed_ba
 | `test_floor_overrides_band_for_underwater_sku` | Loss-prevention priority |
 | `test_lerner_breakeven_matches_gradient` | Analytical breakeven ε* matches the sign of the numerical profit gradient |
 | `test_forecast_features_do_not_leak_current_sales` | A price change becomes visible to the forecaster only the following week |
-| `test_app_interaction_latency` | The app runs headless (Streamlit `AppTest`) without exceptions; a WACC change re-solves in under 200 ms |
+| `test_app_runs_and_solves_fast` | All six tabs run headless (Streamlit `AppTest`, in a subprocess) without exceptions; a WACC change re-solves in under 200 ms |
+| `test_env_respects_guardrails` (4 cases) | Under random actions the RL environment never breaks the floor, the +42% cap or the ±15% band (unless the floor forces a jump) |
+| `test_dp_dominates_myopic_in_expectation` | Over 300 shared demand scenarios, the exact DP earns at least the myopic policy's NPV |
+| `test_unsold_stock_books_a_writedown` | Unsold stock costs (1 − salvage)·COGS, never a phantom gain |
+| `test_review_features_are_leakage_safe` | A review becomes visible only the week after it is written |
 
 ---
 
-## 12. Deviations from the original specification
+## 13. Deviations from the original specification
 
 | Spec said | What was done | Why |
 |---|---|---|
@@ -487,7 +621,7 @@ After de-attenuation and shrinkage, the median SKU elasticity is −1.61 (bed_ba
 
 ---
 
-## 13. Limitations and honest caveats
+## 14. Limitations and honest caveats
 
 1. **COGS is synthesised** from sector benchmarks, not observed. Every CM2 figure inherits this assumption, which is why the dashboard exposes the fee and freight assumptions as sliders.
 2. **Freight treatment matters a lot.** The CM2 definition charges the full freight to the seller; on Olist the customer often pays it. With seller freight share = 0, electronics are no longer CM2-negative.
@@ -497,10 +631,14 @@ After de-attenuation and shrinkage, the median SKU elasticity is −1.61 (bed_ba
 6. **Only 118 SKUs** pass the eligibility filter. That is the cost of requiring enough history for causal identification.
 7. **Optimisation results are not a backtest.** Realised demand at the recommended prices cannot be observed. The portfolio figures are counterfactual model outputs.
 8. **The elasticity is estimated on the full sample**, which is standard for causal estimation. The forecasting evaluation is strictly out-of-sample.
+9. **The RL world is a simulator.** Demand follows the estimated constant-elasticity curve with negative-binomial noise. The agent is only as good as that model, and it has not been validated on live pricing.
+10. **A single-lot season is a stylised setting** (no replenishment, a fixed 50% salvage value). Different salvage or season assumptions change the absolute NPVs.
+11. **Review coverage is thin for price talk.** Only about 3% of reviews mention value or price, which limits the power of the moderation tests. LLM labels can also contain errors; the 87.7% agreement with star ratings is the check.
+12. **Chronos is evaluated zero-shot only.** A version fine-tuned on Olist data might close part of the gap; that was not tested.
 
 ---
 
-## 14. Glossary
+## 15. Glossary
 
 | Term | Meaning |
 |---|---|
@@ -516,3 +654,10 @@ After de-attenuation and shrinkage, the median SKU elasticity is −1.61 (bed_ba
 | **DerSimonian–Laird** | Random-effects estimator of between-unit variance, used here for shrinkage |
 | **Lerner condition** | Margin/elasticity relationship: a price cut pays only if \|ε\| > 1 / margin |
 | **Newsvendor critical ratio** | Underage cost / (underage + overage); sets the optimal service level |
+| **PPO** | Proximal Policy Optimisation: a reinforcement-learning algorithm that improves a neural policy from simulated experience |
+| **Dynamic programming (DP)** | Exact backward solution of a sequential decision problem; the gold-standard benchmark here |
+| **CE-DP / oracle DP** | DP using the *estimated* ε as if true / DP knowing the *true* ε |
+| **Foundation model (Chronos)** | Transformer pretrained on many time series, used without training on our data (zero-shot) |
+| **WQL** | Weighted quantile loss: average pinball loss over the q10/q50/q90 quantiles, scaled by total demand |
+| **Working-Capital-at-Risk (90%)** | Σ(q90 − q50)·COGS: capital needed to move from a 50% to a 90% in-stock rate |
+| **Moderation** | Interaction showing how the price effect changes with another variable |

@@ -53,7 +53,7 @@ def _ols_slope(t: np.ndarray, y: np.ndarray, cluster: np.ndarray) -> tuple[float
 
 
 def residualize(df: pd.DataFrame, y_col: str = "log_q", t_col: str = "log_p",
-                n_folds: int = 5) -> pd.DataFrame:
+                n_folds: int = 5, confounders: list[str] | None = None) -> pd.DataFrame:
     """Steps 1-2: within-SKU demeaning + cross-fitted LightGBM residuals.
 
     Returns df with added columns y_res, t_res (orthogonalised outcome/treatment).
@@ -67,7 +67,7 @@ def residualize(df: pd.DataFrame, y_col: str = "log_q", t_col: str = "log_p",
     fold = df["week"].map(block).to_numpy()
     y_hat = np.zeros(len(df))
     t_hat = np.zeros(len(df))
-    X = df[CONFOUNDERS]
+    X = df[confounders or CONFOUNDERS]
     for k in range(n_folds):
         tr, te = fold != k, fold == k
         y_hat[te] = _nuisance().fit(X[tr], df.loc[tr, f"{y_col}_w"]).predict(X[te])
@@ -163,7 +163,8 @@ def sku_elasticities(res: pd.DataFrame, cat: pd.DataFrame) -> pd.DataFrame:
     return sku
 
 
-def run_dml(panel: pd.DataFrame, sales_weeks_only: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def run_dml(panel: pd.DataFrame, sales_weeks_only: bool = False,
+            extra_confounders: list[str] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Full Phase 3. `sales_weeks_only=True` gives the intensive-margin
     robustness check (ln Q on weeks with Q>0, where price is directly observed).
 
@@ -173,7 +174,32 @@ def run_dml(panel: pd.DataFrame, sales_weeks_only: bool = False) -> tuple[pd.Dat
     if sales_weeks_only:
         feat = feat[feat["has_sale"] == 1].copy()
         feat["log_q"] = np.log(feat["units_sold"])
-    res = residualize(feat)
+    res = residualize(feat, confounders=CONFOUNDERS + (extra_confounders or []))
     cat = category_elasticities(res, feat)
     sku = sku_elasticities(res, cat)
     return cat, sku, res
+
+
+def moderation(res: pd.DataFrame, moderators: list[str]) -> pd.DataFrame:
+    """Does price sensitivity vary with a SKU-week characteristic z?
+
+    Fits y~ = theta0 * t~ + theta1 * t~ * (z - mean z) / sd(z) on the cross-fitted
+    residuals, separately per moderator, with SKU-clustered sandwich SEs.
+    theta1 is the change in the ln(Q+1) price coefficient per 1 SD of z;
+    theta1 > 0 means *less* price-sensitive where z is high.
+    """
+    rows = []
+    t, y, cl = res["t_res"].to_numpy(), res["y_res"].to_numpy(), res["product_id"].to_numpy()
+    for z in moderators:
+        zc = ((res[z] - res[z].mean()) / res[z].std()).to_numpy()
+        X = np.column_stack([t, t * zc])
+        XtX_inv = np.linalg.inv(X.T @ X)
+        beta = XtX_inv @ X.T @ y
+        u = y - X @ beta
+        scores = pd.DataFrame(X * u[:, None]).groupby(cl).sum().to_numpy()
+        g = len(scores)
+        V = XtX_inv @ (scores.T @ scores) @ XtX_inv * g / (g - 1)
+        se = np.sqrt(np.diag(V))
+        rows.append({"moderator": z, "theta0": beta[0], "theta0_se": se[0],
+                     "theta1_per_sd": beta[1], "theta1_se": se[1], "z_stat": beta[1] / se[1]})
+    return pd.DataFrame(rows)

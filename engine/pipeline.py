@@ -5,17 +5,21 @@ The Streamlit app only reads these artifacts, so live interactions never refit.
 """
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 
 import numpy as np
 import pandas as pd
 
-from .config import ARTIFACT_DIR, FIN, PATHS, REPORT_DIR, WINDOW_END, seed_everything
+from . import foundation, reviews
+from .config import ARTIFACT_DIR, FIN, PATHS, REPORT_DIR, ROOT, WINDOW_END, seed_everything
 from .data import build_panel
-from .elasticity import run_dml
+from .elasticity import moderation, run_dml
 from .finance import breakeven_elasticity, holding_rate_annual
 from .forecast import LGB_FEATURES, _lgb_model, add_forecast_features, financial_metrics, walk_forward
 from .optimize import SkuInputs, optimise
+from .rl import rl_summary
 
 Q_FLOOR = 0.2  # units/week: minimum base demand for a live SKU
 SCENARIOS = {"normal (4 wks supply)": 4.0, "aged (12 wks supply)": 12.0}
@@ -72,7 +76,7 @@ def recommend_all(state: pd.DataFrame) -> pd.DataFrame:
 
 def _md(df: pd.DataFrame, floatfmt: str = ".3f") -> str:
     """Minimal markdown table writer (avoids a tabulate dependency)."""
-    cols = list(df.columns)
+    cols = [str(c) for c in df.columns]
     fmt = lambda v: format(v, floatfmt) if isinstance(v, (float, np.floating)) else str(v)  # noqa: E731
     lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     lines += ["| " + " | ".join(fmt(v) for v in row) + " |" for row in df.itertuples(index=False)]
@@ -168,11 +172,51 @@ where the loss-prevention floor overrides the volatility band.
     (REPORT_DIR / "results.md").write_text(txt)
 
 
+def attach_customer_voice(panel: pd.DataFrame) -> pd.DataFrame:
+    """Merge LLM-coded review features into the panel if labels are cached."""
+    if not reviews.LABEL_PATH.exists():
+        return panel
+    labelled = reviews.load_labels(reviews.load_review_texts(set(panel["product_id"])))
+    labelled.to_parquet(ARTIFACT_DIR / "review_labels.parquet")
+    voice = reviews.weekly_voice_features(panel, labelled)
+    return panel.merge(voice, on=["product_id", "week"], how="left")
+
+
+def write_ai_report(cat: pd.DataFrame, cat_v: pd.DataFrame | None, mod: pd.DataFrame | None,
+                    pm: pd.DataFrame, rl: pd.DataFrame) -> None:
+    """Append the AI-extension sections to reports/results.md."""
+    parts = ["\n## 5. GenAI time-series foundation models vs LightGBM (probabilistic, walk-forward)\n",
+             _md(pm),
+             "\nOrder-up-to-q90 newsvendor backtest. `avg_capital_brl_wk` = mean weekly stock value at "
+             "COGS; `wc_at_risk_90` = sum (q90 - q50) x COGS, the capital buying the last 40 points of "
+             "service level. `coverage_q90` should be ~0.90 if the q90 is calibrated.\n"]
+    if cat_v is not None:
+        cmp = cat[["cat_en", "eps_dml", "se_dml"]].merge(
+            cat_v[["cat_en", "eps_dml", "se_dml"]], on="cat_en", suffixes=("", "_with_reviews"))
+        parts += ["\n## 6. LLM-coded customer voice in the causal model\n",
+                  "DML elasticity with and without review-derived confounders:\n", _md(cmp),
+                  "\nModeration: change in the ln(Q+1) price coefficient per 1 SD of each review "
+                  "signal (positive = less price-sensitive). Four moderators are tested, so the "
+                  "Bonferroni 5% threshold is |z| > 2.50:\n", _md(mod)]
+        lab = pd.read_parquet(ARTIFACT_DIR / "review_labels.parquet")
+        stars = np.select([lab["review_score"] <= 2, lab["review_score"] >= 4], [-1, 1], 0)
+        agree = pd.crosstab(lab["review_score"], lab["sentiment"], normalize="index")
+        parts += [f"\nLLM validation against star ratings (which the LLM never saw): sentiment matches "
+                  f"the star polarity for {(lab['sentiment'] == stars)[stars != 0].mean():.1%} of 1-2 and "
+                  f"4-5 star reviews. Row shares by star rating:\n", _md(agree.reset_index(), ".2f")]
+    parts += ["\n## 7. Reinforcement-learning sell-through pricing (26-week season, SELIC 6.5%)\n",
+              _md(rl_summary(rl), ".2f"),
+              "\n`gap_to_oracle`: mean NPV shortfall (R$) versus the exact DP that knows the true "
+              "elasticity. `roi` = total NPV / inventory capital at cost.\n"]
+    with (REPORT_DIR / "results.md").open("a") as f:
+        f.write("\n".join(parts))
+
+
 def main() -> None:
     seed_everything()
     ARTIFACT_DIR.mkdir(exist_ok=True)
     t0 = time.time()
-    panel = build_panel()
+    panel = attach_customer_voice(build_panel())
     panel.to_parquet(PATHS.panel)
     print(f"[1] panel {panel.shape} ({time.time() - t0:.0f}s)")
 
@@ -195,6 +239,34 @@ def main() -> None:
     print(f"[4] {len(state)} live SKUs, {len(rec)} recommendations ({time.time() - t0:.0f}s)")
 
     write_report(metrics, cat, cat_rob, sku, rec, panel, state)
+
+    # ---- AI extensions ---------------------------------------------------
+    voice_cols = [c for c in panel.columns if c.startswith("voice_")] + ["value_perception"]
+    if voice_cols[-1] in panel:
+        cat_v, _, res_v = run_dml(panel, extra_confounders=voice_cols)
+        cat_v.to_parquet(ARTIFACT_DIR / "elasticity_voice.parquet")
+        mod = moderation(res_v, ["value_perception", "voice_quality_bad", "voice_delivery_late",
+                                 "voice_sentiment"])
+        mod.to_parquet(ARTIFACT_DIR / "moderation.parquet")
+        print(f"[5] customer-voice DML ({time.time() - t0:.0f}s)\n{mod.round(3).to_string()}")
+    else:
+        cat_v = mod = None
+        print("[5] skipped: no review labels (run `uv run python -m engine.reviews`)")
+
+    pf = foundation.run(panel)
+    pf.to_parquet(ARTIFACT_DIR / "prob_forecasts.parquet")
+    pm = foundation.probabilistic_metrics(pf)
+    pm.to_parquet(ARTIFACT_DIR / "prob_metrics.parquet")
+    print(f"[6] probabilistic forecasts ({time.time() - t0:.0f}s)\n{pm.round(3).to_string()}")
+
+    # RL needs torch, which must not share a process with LightGBM training.
+    from .rl import MODEL_PATH  # noqa: E402
+    args = (["train"] if not MODEL_PATH.exists() else []) + ["eval"]
+    subprocess.run([sys.executable, "-m", "engine.rl", *args], check=True, cwd=ROOT)
+    rl = pd.read_parquet(ARTIFACT_DIR / "rl_eval.parquet")
+    print(f"[7] RL evaluation ({time.time() - t0:.0f}s)")
+
+    write_ai_report(cat, cat_v, mod, pm, rl)
     print(f"report -> {REPORT_DIR / 'results.md'}")
 
 
