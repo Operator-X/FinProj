@@ -1,4 +1,4 @@
-"""Probabilistic forecasting: GenAI time-series foundation models vs LightGBM.
+"""Phase 5B: probabilistic forecasting with GenAI time-series foundation models vs LightGBM.
 
 Chronos models are transformer language models pretrained on large corpora of
 time series; here they forecast Olist demand *zero-shot* (no training on our

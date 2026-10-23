@@ -88,7 +88,29 @@ until leftover stock is sold through, which pushes elastic SKUs toward the floor
 `band_overridden` counts SKUs whose 1.15x COGS floor exceeds +15% of the current price,
 where the loss-prevention floor overrides the volatility band.
 
-## 5. GenAI time-series foundation models vs LightGBM (probabilistic, walk-forward)
+## 5A. Phase 5A: reinforcement-learning sell-through pricing (26-week season, SELIC 6.5%)
+
+| regime | policy | npv | gap_to_oracle | sell_through | avg_price_ratio | roi |
+|---|---|---|---|---|---|---|
+| lean (<13 wks) | CE-DP | 325.91 | -0.79 | 0.93 | 1.37 | 0.67 |
+| lean (<13 wks) | PPO agent | 326.15 | -0.55 | 0.94 | 1.37 | 0.67 |
+| lean (<13 wks) | myopic (Phase 4) | 322.02 | -4.69 | 0.92 | 1.36 | 0.66 |
+| lean (<13 wks) | oracle DP | 326.71 | 0.00 | 0.94 | 1.37 | 0.67 |
+| lean (<13 wks) | status quo | 75.80 | -250.90 | 0.98 | 1.01 | 0.16 |
+| full (13-26 wks) | CE-DP | 499.66 | -4.93 | 0.79 | 1.36 | 0.49 |
+| full (13-26 wks) | PPO agent | 497.93 | -6.66 | 0.79 | 1.36 | 0.48 |
+| full (13-26 wks) | myopic (Phase 4) | 493.45 | -11.14 | 0.76 | 1.38 | 0.48 |
+| full (13-26 wks) | oracle DP | 504.59 | 0.00 | 0.80 | 1.35 | 0.49 |
+| full (13-26 wks) | status quo | 111.51 | -393.07 | 0.90 | 1.01 | 0.11 |
+| overstock (>26 wks) | CE-DP | 61.83 | -21.58 | 0.55 | 1.34 | 0.04 |
+| overstock (>26 wks) | PPO agent | 61.75 | -21.66 | 0.55 | 1.34 | 0.04 |
+| overstock (>26 wks) | myopic (Phase 4) | 58.60 | -24.81 | 0.50 | 1.38 | 0.04 |
+| overstock (>26 wks) | oracle DP | 83.41 | 0.00 | 0.57 | 1.32 | 0.05 |
+| overstock (>26 wks) | status quo | -203.79 | -287.20 | 0.65 | 1.01 | -0.12 |
+
+`gap_to_oracle`: mean NPV shortfall (R$) versus the exact DP that knows the true elasticity. `roi` = total NPV / inventory capital at cost.
+
+## 5B. Phase 5B: GenAI foundation models vs LightGBM (probabilistic, walk-forward)
 
 | model | WAPE_median | WQL | coverage_80 | coverage_q90 | stockout_loss_brl | excess_holding_brl | fill_rate | avg_capital_brl_wk | wc_at_risk_90_brl_wk |
 |---|---|---|---|---|---|---|---|---|---|
@@ -99,7 +121,7 @@ where the loss-prevention floor overrides the volatility band.
 Order-up-to-q90 newsvendor backtest. `avg_capital_brl_wk` = mean weekly stock value at COGS; `wc_at_risk_90` = sum (q90 - q50) x COGS, the capital buying the last 40 points of service level. `coverage_q90` should be ~0.90 if the q90 is calibrated.
 
 
-## 6. LLM-coded customer voice in the causal model
+## 5C. Phase 5C: LLM-coded customer voice in the causal model
 
 DML elasticity with and without review-derived confounders:
 
@@ -129,25 +151,3 @@ LLM validation against star ratings (which the LLM never saw): sentiment matches
 | 3 | 0.52 | 0.28 | 0.20 |
 | 4 | 0.13 | 0.20 | 0.67 |
 | 5 | 0.02 | 0.05 | 0.93 |
-
-## 7. Reinforcement-learning sell-through pricing (26-week season, SELIC 6.5%)
-
-| regime | policy | npv | gap_to_oracle | sell_through | avg_price_ratio | roi |
-|---|---|---|---|---|---|---|
-| lean (<13 wks) | CE-DP | 325.91 | -0.79 | 0.93 | 1.37 | 0.67 |
-| lean (<13 wks) | PPO agent | 326.15 | -0.55 | 0.94 | 1.37 | 0.67 |
-| lean (<13 wks) | myopic (Phase 4) | 322.02 | -4.69 | 0.92 | 1.36 | 0.66 |
-| lean (<13 wks) | oracle DP | 326.71 | 0.00 | 0.94 | 1.37 | 0.67 |
-| lean (<13 wks) | status quo | 75.80 | -250.90 | 0.98 | 1.01 | 0.16 |
-| full (13-26 wks) | CE-DP | 499.66 | -4.93 | 0.79 | 1.36 | 0.49 |
-| full (13-26 wks) | PPO agent | 497.93 | -6.66 | 0.79 | 1.36 | 0.48 |
-| full (13-26 wks) | myopic (Phase 4) | 493.45 | -11.14 | 0.76 | 1.38 | 0.48 |
-| full (13-26 wks) | oracle DP | 504.59 | 0.00 | 0.80 | 1.35 | 0.49 |
-| full (13-26 wks) | status quo | 111.51 | -393.07 | 0.90 | 1.01 | 0.11 |
-| overstock (>26 wks) | CE-DP | 61.83 | -21.58 | 0.55 | 1.34 | 0.04 |
-| overstock (>26 wks) | PPO agent | 61.75 | -21.66 | 0.55 | 1.34 | 0.04 |
-| overstock (>26 wks) | myopic (Phase 4) | 58.60 | -24.81 | 0.50 | 1.38 | 0.04 |
-| overstock (>26 wks) | oracle DP | 83.41 | 0.00 | 0.57 | 1.32 | 0.05 |
-| overstock (>26 wks) | status quo | -203.79 | -287.20 | 0.65 | 1.01 | -0.12 |
-
-`gap_to_oracle`: mean NPV shortfall (R$) versus the exact DP that knows the true elasticity. `roi` = total NPV / inventory capital at cost.

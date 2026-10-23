@@ -1,4 +1,4 @@
-"""Customer-voice signals: LLM-coded review themes -> causal features.
+"""Phase 5C: customer-voice signals from LLM-coded review themes -> causal features.
 
 Olist reviews are free-text Portuguese. An LLM (Claude, via the `claude -p`
 CLI) codes each comment into a fixed finance-relevant taxonomy; labels are

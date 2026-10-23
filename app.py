@@ -1,4 +1,4 @@
-"""Phase 5: live pricing & liquidity simulator.
+"""Phase 6: interactive dashboard over Phases 1-5.
 
 Run: uv run streamlit run app.py   (after `uv run python -m engine.pipeline`)
 
@@ -38,7 +38,7 @@ def load() -> dict[str, pd.DataFrame]:
 
 @st.cache_data
 def load_ai() -> dict[str, pd.DataFrame]:
-    """Optional AI-extension artifacts (absent until the pipeline has produced them)."""
+    """Phase 5 artifacts (absent until the pipeline has produced them)."""
     names = ["prob_forecasts", "prob_metrics", "rl_eval", "review_labels", "moderation",
              "elasticity_voice"]
     return {n: pd.read_parquet(ARTIFACT_DIR / f"{n}.parquet") for n in names

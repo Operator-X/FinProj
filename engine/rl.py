@@ -1,4 +1,4 @@
-"""Multi-period pricing: a reinforcement-learning agent for single-lot sell-through.
+"""Phase 5A: multi-period pricing with a reinforcement-learning agent for single-lot sell-through.
 
 Problem (one SKU, one season of H weeks)
   * A lot of I0 units is on hand; no replenishment. Unsold units at the end

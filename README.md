@@ -1,35 +1,46 @@
 # Algorithmic Working Capital & Margin Optimization
 ### A Causal Double-ML Dynamic Pricing & Liquidity Engine on Brazilian E-Commerce Data
 
-This engine turns transaction-level marketplace data into weekly pricing decisions. It does **not** maximise revenue. It maximises **Contribution Margin 2 (CM2) minus the cost of capital tied up in inventory**. Every decision is bounded by hard financial guardrails: a margin floor, a volatility band, and an aged-stock liquidation trigger. Every model result is reported alongside its financial counterpart.
+This engine turns transaction-level marketplace data into pricing decisions that maximise **Contribution Margin 2 (CM2) minus the cost of capital tied up in inventory**, not revenue.
 
-It is built on the public Olist dataset (about 100k Brazilian orders, 2016–2018) and the Brazilian Central Bank's SELIC policy-rate series.
+**What it does:**
+- forecasts demand with calibrated uncertainty;
+- estimates *causal* price sensitivity;
+- reads what customers say in their reviews;
+- prices each product for this week, and plans prices across a whole selling season with a reinforcement-learning agent.
+
+**How it stays safe:** every decision is bounded by hard financial guardrails (a margin floor, a volatility band and an aged-stock liquidation trigger).
+
+**How it reports:** every model result is paired with its financial counterpart.
+
+**Data:** the public Olist dataset (about 100k Brazilian orders, 2016–2018) and the Brazilian Central Bank's SELIC policy-rate series.
 
 ---
 
 ## Contents
 
 1. [Quick start](#1-quick-start)
-2. [Data sources](#2-data-sources)
-3. [Repository layout](#3-repository-layout)
-4. [Phase 0: financial invariants and engineering rules](#4-phase-0-financial-invariants-and-engineering-rules)
-5. [Phase 1: data engineering and unit economics](#5-phase-1-data-engineering-and-unit-economics)
-6. [Phase 2: demand forecasting with a financial scorecard](#6-phase-2-demand-forecasting-with-a-financial-scorecard)
-7. [Phase 3: causal price elasticity (Double ML)](#7-phase-3-causal-price-elasticity-double-ml)
-8. [Phase 4: constrained price optimisation](#8-phase-4-constrained-price-optimisation)
-9. [Phase 5: the interactive dashboard](#9-phase-5-the-interactive-dashboard)
-10. [Results](#10-results)
-11. [AI extensions: RL agent, GenAI forecasting, LLM review mining](#11-ai-extensions-rl-agent-genai-forecasting-llm-review-mining)
-12. [Tests](#12-tests)
-13. [Deviations from the original specification](#13-deviations-from-the-original-specification)
-14. [Limitations and honest caveats](#14-limitations-and-honest-caveats)
-15. [Glossary](#15-glossary)
+2. [Architecture: seven phases](#2-architecture-seven-phases)
+3. [Data sources](#3-data-sources)
+4. [Repository layout](#4-repository-layout)
+5. [Phase 0: financial invariants and engineering rules](#5-phase-0-financial-invariants-and-engineering-rules)
+6. [Phase 1: data engineering and unit economics](#6-phase-1-data-engineering-and-unit-economics)
+7. [Phase 2: demand forecasting with a financial scorecard](#7-phase-2-demand-forecasting-with-a-financial-scorecard)
+8. [Phase 3: causal price elasticity (Double ML)](#8-phase-3-causal-price-elasticity-double-ml)
+9. [Phase 4: constrained price optimisation](#9-phase-4-constrained-price-optimisation)
+10. [Phase 5: AI decision layer](#10-phase-5-ai-decision-layer)
+11. [Phase 6: interactive dashboard](#11-phase-6-interactive-dashboard)
+12. [Results](#12-results)
+13. [Tests](#13-tests)
+14. [Design decisions](#14-design-decisions)
+15. [Limitations and honest caveats](#15-limitations-and-honest-caveats)
+16. [Glossary](#16-glossary)
 
 ---
 
 ## 1. Quick start
 
-Requirements: macOS or Linux, [`uv`](https://github.com/astral-sh/uv), and Python 3.12 (uv installs it if missing).
+Requirements: macOS or Linux, [`uv`](https://github.com/astral-sh/uv), Python 3.12 (uv installs it if missing), and the Claude Code CLI for Phase 5C.
 
 ```bash
 cd finproj
@@ -42,33 +53,82 @@ uv run kaggle datasets download -d olistbr/brazilian-ecommerce -p data/raw --unz
 curl -s 'https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados?formato=json&dataInicial=01/09/2016&dataFinal=31/10/2018' \
      -o data/raw/selic_432.json
 
-# 2) LLM review labels (once; labels are cached in data/labels/, resumable)
+# 2) Phase 5C: LLM review labels (once; cached in data/labels/, resumable)
 uv run python -m engine.reviews           # ~35 batched `claude -p --model haiku` calls
 
-# 3) Batch pipeline: all phases + AI extensions (~4 min; first run also trains the RL agent)
+# 3) Phases 1-5 batch pipeline (~4 min; the first run also trains the RL agent)
 uv run python -m engine.pipeline          # -> artifacts/*.parquet, reports/results.md
 uv run python -m engine.rl train eval     # optional: retrain the PPO agent (~4.5 min) and re-evaluate
 
-# 4) Dashboard
+# 4) Phase 6: dashboard
 uv run streamlit run app.py               # http://localhost:8501
 
 # 5) Tests
 uv run pytest                             # 36 tests
 ```
 
-The first pipeline run downloads two Chronos foundation models from Hugging Face (`amazon/chronos-bolt-small`, `amazon/chronos-2`). Step 2 needs the Claude Code CLI; without labels, the review stage is skipped and everything else still runs.
-
-If `selic_432.json` is missing, the engine falls back to a hard-coded table of the COPOM rate decisions (see `engine/finance.py`), so the pipeline still runs offline.
+- **Model downloads:** the first pipeline run downloads two Chronos foundation models from Hugging Face (`amazon/chronos-bolt-small`, `amazon/chronos-2`).
+- **Without review labels:** the Phase 5C stage is skipped and everything else still runs.
+- **Without the SELIC file:** if `selic_432.json` is missing, the engine falls back to a hard-coded table of COPOM rate decisions (`engine/finance.py`).
 
 ---
 
-## 2. Data sources
+## 2. Architecture: seven phases
+
+```
+                 Olist transactions + reviews          BACEN SELIC series
+                              │                               │
+Phase 0  Guardrails & rules ──┼───────────────────────────────┼──── apply to every phase below
+                              ▼                               ▼
+Phase 1  Weekly SKU panel, unit economics (CM2), SELIC-linked carrying cost
+                              │
+            ┌─────────────────┼──────────────────────────┐
+            ▼                 ▼                          ▼
+Phase 2  Point forecasts   Phase 3  Causal elasticity   Phase 5C  LLM customer voice
+         (LightGBM vs      (fixed-effects Double ML)    (review themes → confounders,
+          baselines)                │                    heterogeneity tests)
+            │                       │                          │
+            │   Phase 5B  Probabilistic forecasts               │
+            │   (Chronos foundation models vs LightGBM          │
+            │    quantiles → working-capital-at-risk)           │
+            ▼                       ▼                          │
+Phase 4  This week's price: constrained CM2 − carry optimiser ◄─┘
+                              │
+Phase 5A  Whole-season price path: RL agent (PPO) benchmarked against exact dynamic programming
+                              │
+Phase 6  Interactive dashboard: 6 tabs, every interaction < 200 ms
+```
+
+| Phase | Question it answers | Module |
+|---|---|---|
+| 0 | What may the engine never do? | `config.py`, `finance.py` |
+| 1 | What does each sale actually earn, and what does stock cost to hold? | `data.py` |
+| 2 | How many units will sell next week? | `forecast.py` |
+| 3 | How much does price *cause* demand to change? | `elasticity.py` |
+| 4 | What is the best price this week? | `optimize.py` |
+| 5A | What is the best price *path* to sell a lot of stock over a season? | `rl.py` |
+| 5B | How much stock, and how much working capital, does a target service level need? | `foundation.py` |
+| 5C | What do customers say, and does it change price sensitivity? | `reviews.py` |
+| 6 | How does a decision-maker explore all of this live? | `app.py` |
+
+Phases 1–4 form the **causal pricing core**. Phase 5 adds the **AI decision layer**:
+- 5A extends the one-week decision to a whole season;
+- 5B turns point forecasts into calibrated distributions, and so into capital requirements;
+- 5C adds unstructured text to the causal model.
+
+Phase 6 puts every phase in front of the user.
+
+---
+
+## 3. Data sources
 
 | Source | What it gives | Used for |
 |---|---|---|
-| **Olist Brazilian E-Commerce** (Kaggle `olistbr/brazilian-ecommerce`) | Orders, order items (price, freight), products (category), reviews, sellers | Demand, prices, freight, delivery lead times, review scores |
-| **BACEN SGS series 432** (SELIC target rate, daily) | Policy rate, 14.25% (Sep 2016) → 6.50% (Mar 2018) | Cost of capital for inventory carrying cost |
+| **Olist Brazilian E-Commerce** (Kaggle `olistbr/brazilian-ecommerce`) | Orders, order items (price, freight), products (category), reviews (stars + Portuguese text), sellers | Demand, prices, freight, delivery lead times, review signals |
+| **BACEN SGS series 432** (SELIC target rate, daily) | Policy rate, 14.25% (Sep 2016) → 6.50% (Mar 2018) | Cost of capital for inventory carrying cost and RL discounting |
 | **Sector gross-margin benchmarks** (Damodaran LatAm retail; Mercado Libre filings) | Typical COGS share of price by sector | Synthesising COGS, which Olist does not record |
+| **Chronos foundation models** (Amazon, Hugging Face) | Pretrained time-series transformers | Zero-shot probabilistic forecasts (Phase 5B) |
+| **Claude Haiku** (via the Claude Code CLI) | Language understanding | Coding review text into themes (Phase 5C) |
 
 SELIC changes picked up from the API (effective dates):
 
@@ -86,50 +146,46 @@ SELIC changes picked up from the API (effective dates):
 
 ---
 
-## 3. Repository layout
+## 4. Repository layout
 
 ```
 finproj/
 ├── engine/                  # all modelling logic, importable and tested
 │   ├── config.py            # Phase 0: seeds, window, categories, COGS shares, guardrails, artifact paths
-│   ├── finance.py           # unit economics: CM2, holding cost, DSI, safety stock, Lerner breakeven, SELIC loader
+│   ├── finance.py           # Phase 0/1: CM2, holding cost, DSI, safety stock, Lerner breakeven, SELIC loader
 │   ├── data.py              # Phase 1: transactions -> weekly SKU panel
 │   ├── forecast.py          # Phase 2: 3 forecasters, walk-forward CV, financial scorecard
-│   ├── elasticity.py        # Phase 3: fixed-effects Double ML + SKU shrinkage
+│   ├── elasticity.py        # Phase 3: fixed-effects Double ML, SKU shrinkage, moderation tests
 │   ├── optimize.py          # Phase 4: constrained price optimiser + uncertainty band
-│   ├── rl.py                # AI: sell-through simulator, exact DP, PPO agent, Bayesian elasticity learning
-│   ├── foundation.py        # AI: Chronos foundation models vs LightGBM quantiles, newsvendor backtest
-│   ├── reviews.py           # AI: LLM review coding (Claude) -> leakage-safe customer-voice features
-│   └── pipeline.py          # batch orchestration + reports/results.md writer
-├── app.py                   # Streamlit app: 6 tabs (reads artifacts only)
-├── tests/test_engine.py     # guardrail invariants, leakage test, Lerner test, app latency
-├── tests/test_ai.py         # RL guardrails, DP vs myopic, write-down accounting, review leakage
-├── data/labels/             # cached LLM review labels (small, safe to commit)
-├── artifacts/               # (generated) parquet tables consumed by the app
-├── reports/results.md       # (generated) every number in this README, regenerated each run
+│   ├── rl.py                # Phase 5A: sell-through simulator, exact DP, PPO agent, Bayesian elasticity learning
+│   ├── foundation.py        # Phase 5B: Chronos foundation models vs LightGBM quantiles, newsvendor backtest
+│   ├── reviews.py           # Phase 5C: LLM review coding (Claude) -> leakage-safe customer-voice features
+│   └── pipeline.py          # batch orchestration of Phases 1-5 + reports/results.md writer
+├── app.py                   # Phase 6: Streamlit dashboard, 6 tabs (reads artifacts only)
+├── tests/test_engine.py     # Phases 0-4 and 6: guardrails, leakage, Lerner test, app latency
+├── tests/test_ai.py         # Phase 5: RL guardrails, DP vs myopic, write-down accounting, review leakage
+├── data/labels/             # Phase 5C: cached LLM review labels (small, safe to commit)
 ├── data/raw/                # (downloaded) Olist CSVs + SELIC JSON
+├── artifacts/               # (generated) parquet tables and the trained policy consumed by the app
+├── reports/results.md       # (generated) every number in this README, regenerated each run
 └── pyproject.toml / uv.lock # pinned environment (Python 3.12)
 ```
 
 **Artifacts produced by `engine.pipeline`:**
 
-| File | Grain | Content |
-|---|---|---|
-| `panel.parquet` | SKU × week | Modelling panel with all features and unit economics |
-| `forecasts.parquet` | SKU × week (hold-out) | Actuals plus three model forecasts per walk-forward origin |
-| `forecast_metrics.parquet` | model | Statistical and financial scorecard |
-| `elasticity_category.parquet` | category | DML elasticity, CI, and naive OLS comparisons |
-| `elasticity_sku.parquet` | SKU | Raw, shrunk and de-attenuated elasticities, regime label |
-| `sku_state.parquet` | live SKU | Everything needed to price a SKU in the decision week |
-| `recommendations.parquet` | SKU × scenario × mode | Precomputed portfolio recommendations |
-| `prob_forecasts.parquet`, `prob_metrics.parquet` | SKU × week × model / model | Quantile forecasts (Chronos, LightGBM) and their financial scorecard |
-| `review_labels.parquet` | review | LLM-coded themes and sentiment per review |
-| `elasticity_voice.parquet`, `moderation.parquet` | category / moderator | DML with review confounders; heterogeneity by perception |
-| `ppo_pricing.zip`, `rl_eval.parquet` | — / SKU × season × policy | Trained RL policy; out-of-sample policy comparison |
+| File | Phase | Grain | Content |
+|---|---|---|---|
+| `panel.parquet` | 1 | SKU × week | Modelling panel with features, unit economics and customer-voice signals |
+| `forecasts.parquet`, `forecast_metrics.parquet` | 2 | SKU × week / model | Point forecasts per walk-forward origin; statistical and financial scorecard |
+| `elasticity_category.parquet`, `elasticity_sku.parquet` | 3 | category / SKU | DML elasticities with CIs and naive comparisons; shrunk, de-attenuated SKU elasticities |
+| `sku_state.parquet`, `recommendations.parquet` | 4 | live SKU / SKU × scenario × mode | Pricing state per SKU; precomputed portfolio recommendations |
+| `ppo_pricing.zip`, `rl_eval.parquet` | 5A | — / SKU × season × policy | Trained RL policy; out-of-sample policy comparison |
+| `prob_forecasts.parquet`, `prob_metrics.parquet` | 5B | SKU × week × model / model | Quantile forecasts; probabilistic and newsvendor scorecard |
+| `review_labels.parquet`, `elasticity_voice.parquet`, `moderation.parquet` | 5C | review / category / moderator | LLM labels; DML with review confounders; heterogeneity tests |
 
 ---
 
-## 4. Phase 0: financial invariants and engineering rules
+## 5. Phase 0: financial invariants and engineering rules
 
 All parameters live in `engine/config.py` (`FinanceParams`), so the pipeline, the dashboard and the report can never disagree.
 
@@ -137,29 +193,37 @@ All parameters live in `engine/config.py` (`FinanceParams`), so the pipeline, th
 
 | Rule | Implementation |
 |---|---|
-| Never optimise top-line revenue | Objective is CM2 − carrying cost (`optimize.profit`) |
-| Margin floor: P ≥ 1.15 × COGS | `bounds()`; tested over 24 parameter combinations |
+| Never optimise top-line revenue | Objective is CM2 − carrying cost in Phase 4 (`optimize.profit`), and CM2 − carry − write-down in Phase 5A |
+| Margin floor: P ≥ 1.15 × COGS | `bounds()` in Phase 4 and `Lot.floor_k()` in Phase 5A; both tested |
 | Liquidation floor: P ≥ 1.00 × COGS when weeks-of-supply > 8 | `aging_trigger_weeks = 8`, `floor_liquidation = 1.00` |
-| Volatility band: 0.85 × P_last ≤ P ≤ 1.15 × P_last | `band = 0.15` |
+| Volatility band: 0.85 × P_last ≤ P ≤ 1.15 × P_last | `band = 0.15`; in Phase 5A, at most two lattice steps of √1.15 per week |
 | Holding cost tied to macro: H_annual = SELIC_t + 6% | `holding_rate_annual()`; weekly SELIC merged into every row |
-| Elasticity only from orthogonalised estimators | Double ML in `elasticity.py`; naive OLS is shown only as a contrast |
+| Elasticity only from orthogonalised estimators | Double ML in Phase 3; naive OLS is shown only as a contrast |
 
 **Guardrail priority.** If the 1.15 × COGS floor is above the +15% band ceiling (a SKU currently priced below its floor), the floor wins and the SKU is flagged `band_overridden`. Loss prevention ranks above price smoothness.
 
 ### Engineering rules
 
 - **Type hints and docstrings** on every function, stating input/output shapes and finance definitions.
-- **No leakage.** All demand features are lagged (`shift(1)`). Validation is walk-forward only; there is no random shuffling across time anywhere, and even the DML cross-fitting folds are contiguous time blocks.
-- **Reproducibility.** `SEED = 42` for numpy, LightGBM (`deterministic=True`), and the optimiser's uncertainty draws.
-- **Latency.** The dashboard never refits a model; one interaction re-solves a single SKU's 1-D price problem in about 10 ms.
+- **No leakage.**
+  - All demand features are lagged (`shift(1)`), and review signals become visible only the week after they are written.
+  - Validation is walk-forward only. There is no random shuffling across time anywhere; even the DML cross-fitting folds are contiguous time blocks.
+- **Reproducibility.**
+  - `SEED = 42` for numpy, LightGBM (`deterministic=True`), PyTorch/PPO, the optimiser's uncertainty draws and the RL evaluation scenarios.
+  - LLM labels are cached, so results never depend on re-querying a model.
+- **Latency.** The dashboard never refits a model. One pricing interaction re-solves a single SKU's 1-D price problem in about 10 ms.
+- **Process isolation.** PyTorch (Chronos, PPO) and LightGBM ship different OpenMP runtimes, and on macOS combining them in one process segfaults or deadlocks. So:
+  - the pipeline runs the PyTorch stages as separate processes;
+  - the dashboard never imports LightGBM;
+  - the app test runs in its own subprocess.
 
 ---
 
-## 5. Phase 1: data engineering and unit economics
+## 6. Phase 1: data engineering and unit economics
 
 `engine/data.py → build_panel()`
 
-### 5.1 Scope
+### 6.1 Scope
 
 | Choice | Value | Why |
 |---|---|---|
@@ -171,7 +235,7 @@ All parameters live in `engine/config.py` (`FinanceParams`), so the pipeline, th
 
 Result: **118 SKUs, 6,104 SKU-weeks, 8,315 units, with 52% of weeks having zero sales.**
 
-### 5.2 Panel construction
+### 6.2 Panel construction
 
 1. **Item → (SKU, week) aggregation:** `units_sold` (item count), `avg_price`, `avg_freight`, `seller_count`, review sums, and mean `delivery_days` (purchase to customer delivery).
 2. **Active listing span.** Each SKU runs from its first sale week to its last sale week + 4 weeks, capped at the window end. Genuine post-sale zero weeks are kept, but a delisted product is not padded with zeros forever.
@@ -189,8 +253,9 @@ Result: **118 SKUs, 6,104 SKU-weeks, 8,315 units, with 52% of weeks having zero 
    - A **May-2018 truckers' strike** flag, a national logistics shock that is not a demand effect.
    - Two harmonics of annual Fourier seasonality, plus a time index.
 7. **Macro:** weekly mean SELIC merged by week.
+8. **Customer voice:** the Phase 5C review signals are merged in by (SKU, week) when labels are available.
 
-### 5.3 Unit economics (synthesised COGS)
+### 6.3 Unit economics (synthesised COGS)
 
 Olist records the selling price P and freight F but not the seller's acquisition cost. COGS is therefore reconstructed from sector gross-margin benchmarks, applied to each SKU's **baseline price** (the median transacted price):
 
@@ -209,7 +274,7 @@ h_t        = H_annual / 52 · COGS                    weekly carrying cost of on
 DSI (days) = inventory / weekly units · 7
 ```
 
-**First finding (unit economics):**
+**Finding (unit economics):**
 
 | Category | Median price | Median freight | Median CM2 / unit | Share of SKU-weeks with CM2 < 0 |
 |---|---|---|---|---|
@@ -222,17 +287,18 @@ Low-ticket electronics are **structurally CM2-negative** when the seller absorbs
 
 ---
 
-## 6. Phase 2: demand forecasting with a financial scorecard
+## 7. Phase 2: demand forecasting with a financial scorecard
 
 `engine/forecast.py`
 
-### 6.1 Validation protocol (walk-forward, no leakage)
+### 7.1 Validation protocol (walk-forward, no leakage)
 
 - **Hold-out:** 2018-03-05 → 2018-08-20.
 - **Rolling origins:** every 4 weeks (7 origins). At each origin every model is **refit on weeks strictly before the origin**, then issues **one-step-ahead** forecasts for the next 4 weeks. One step ahead matches the weekly repricing cadence.
 - **Scoring:** only SKUs already listed before the origin are scored (110 SKUs, 2,374 SKU-weeks). A SKU's first week always contains a sale by construction, and scoring it would reward knowing the launch date.
+- **Shared protocol:** Phase 5B uses this exact protocol, so point and probabilistic forecasts are directly comparable.
 
-### 6.2 A subtle leakage trap, and the fix
+### 7.2 A subtle leakage trap, and the fix
 
 In a zero-sale week the price is unobserved and forward-filled. So if this week's price differs from last week's, a sale must have happened, and a model given the contemporaneous price would learn "price changed ⇒ sale". The forecaster therefore only sees:
 
@@ -241,7 +307,7 @@ In a zero-sale week the price is unobserved and forward-filled. So if this week'
 
 This is enforced by `add_forecast_features()` and locked in by `test_forecast_features_do_not_leak_current_sales`.
 
-### 6.3 Models
+### 7.3 Models
 
 | Model | Specification |
 |---|---|
@@ -249,7 +315,7 @@ This is enforced by `add_forecast_features()` and locked in by `test_forecast_fe
 | **SARIMAX** | Per SKU, ARIMA(1,0,1) + constant on ln(1+Q). Exogenous: posted log-price, holiday flag, truckers-strike flag, SELIC, annual Fourier terms (series are too short for a seasonal AR term). Parameters are frozen at the origin and filtered one step ahead. A plausibility guard rejects any forecast above 2× the SKU's historical peak and falls back to the 4-week mean |
 | **LightGBM-Tweedie** (challenger) | One global model across SKUs, Tweedie loss (variance power 1.2) for zero-inflated, right-skewed counts. 25 features: lags, rolling stats, listing age, posted price, price ratio, category velocity, sellers, delivery days, reviews, SELIC, seasonality, events, category |
 
-### 6.4 Financial evaluation layer
+### 7.4 Financial evaluation layer
 
 Each statistical metric is paired with a balance-sheet or P&L metric:
 
@@ -262,15 +328,15 @@ Each statistical metric is paired with a balance-sheet or P&L metric:
 
 ---
 
-## 7. Phase 3: causal price elasticity (Double ML)
+## 8. Phase 3: causal price elasticity (Double ML)
 
 `engine/elasticity.py`
 
-### 7.1 Why a plain regression is wrong here
+### 8.1 Why a plain regression is wrong here
 
 Prices are not set at random. Sellers move prices in response to demand: they promote into Black Friday and drift prices as the platform grows. Regressing demand on price therefore picks up timing, not causation.
 
-### 7.2 Model
+### 8.2 Model
 
 A partially linear model with SKU fixed effects, for SKU i in week t:
 
@@ -285,8 +351,9 @@ ln(P_it)     =                m(X_it) + b_i + v_it
 - Category velocity and the category median price (competitor index).
 - Lagged delivery lead time, cumulative review score, lagged seller count.
 - SELIC, Fourier seasonality, the seven event dummies, and category.
+- In the Phase 5C specification, also the LLM-coded customer-voice signals.
 
-### 7.3 Estimator (Frisch–Waugh–Lovell with ML nuisances)
+### 8.3 Estimator (Frisch–Waugh–Lovell with ML nuisances)
 
 1. **Within-transform** Y and T by SKU. This removes a_i and b_i (fixed brand or quality level).
 2. **Cross-fitted nuisances.** LightGBM models for E[Y|X] and E[T|X], using 5 folds made of **contiguous calendar-week blocks**. Each residual comes from a model that never saw that time block.
@@ -296,29 +363,30 @@ Estimates are produced for the whole pool and per category (from the same cross-
 - **pooled OLS**, which mixes price levels across SKUs;
 - **within-SKU OLS without confounder adjustment**.
 
-### 7.4 From category to SKU elasticities
+### 8.4 From category to SKU elasticities
 
 1. **Per-SKU slope** on that SKU's residuals, with its standard error.
 2. **Empirical-Bayes shrinkage** toward the category estimate. The between-SKU variance τ² comes from **DerSimonian–Laird** random-effects meta-analysis:
    `θ_i^EB = (τ²·θ_i + se_i²·θ_cat) / (τ² + se_i²)`.
    SKUs with little price variation inherit the category value; well-identified SKUs keep their own.
 3. **De-attenuation of log1p.** θ is d ln(Q+1)/d ln P. The demand elasticity is d ln Q/d ln P = θ·(Q+1)/Q, evaluated at the SKU's mean weekly units. At 1–2 units a week, θ alone understates sensitivity by roughly half.
-4. **Uncertainty:** the SKU SE combines the posterior SE with the category SE, so a SKU is never more precise than the category it borrows from.
+4. **Uncertainty:** the SKU SE combines the posterior SE with the category SE, so a SKU is never more precise than the category it borrows from. This posterior is also the RL agent's prior belief in Phase 5A.
 5. **Sign restriction.** An upward-sloping demand estimate (20 of 118 SKUs) is treated as noise, and the SKU falls back to its category estimate.
 6. **Winsorising** at ε = −5 (4 SKUs), beyond what weekly price variation can identify.
 7. **Regime label:** |ε| < 1 → *Inelastic: margin expansion*; |ε| > 1 → *Elastic: liquidity acceleration*. The split is 73 / 45 SKUs.
 
-### 7.5 Robustness check
+### 8.5 Robustness and heterogeneity
 
-The same DML on **sale weeks only** with outcome ln Q (the intensive margin, where price is directly observed) gives estimates in the same direction and of similar magnitude to the de-attenuated main estimates (see §10.2).
+- **Intensive margin.** The same DML on **sale weeks only**, with outcome ln Q (where price is directly observed), gives estimates in the same direction and of similar magnitude to the de-attenuated main estimates (§12.2).
+- **Moderation.** `moderation()` re-uses the cross-fitted residuals to test whether θ varies with a SKU-week characteristic z: Ỹ = θ₀T̃ + θ₁T̃·z_std, with SKU-clustered SEs. Phase 5C applies it to the customer-voice signals.
 
 ---
 
-## 8. Phase 4: constrained price optimisation
+## 9. Phase 4: constrained price optimisation
 
 `engine/optimize.py`
 
-### 8.1 Objective
+### 9.1 Objective
 
 For one SKU and the coming week:
 
@@ -330,14 +398,14 @@ Q(P)  = Q_base · (P / P_last)^ε                         constant-elasticity de
 - `Q_base` is a **true one-step-ahead LightGBM forecast** for the decision week (2018-08-20), at the status-quo price, from a model trained only on earlier weeks.
 - Sales are capped by the inventory I on hand.
 
-### 8.2 Two strategy modes
+### 9.2 Two strategy modes
 
 | Mode | Holding cost | Interpretation |
 |---|---|---|
-| **Margin Maximization (EBITDA)** | h · max(0, I − Q(P)) | One week of carry on leftover stock. This is the specification's objective |
+| **Margin Maximization (EBITDA)** | h · max(0, I − Q(P)) | One week of carry on leftover stock |
 | **Aggressive Cash Recovery (Liquidity)** | h · L · min(L/Q(P), 52) / 2, with L = leftover units | Carry on leftover stock **until it is sold through** at the rate implied by the chosen price (linear depletion, capped at 52 weeks). This prices the remaining cash-conversion cycle, so slower sell-through costs more |
 
-### 8.3 Constraints
+### 9.3 Constraints
 
 ```
 P ≥ 1.15 · COGS                (1.00 · COGS if I / Q_base > 8 weeks: aged-stock liquidation)
@@ -345,18 +413,18 @@ P ≥ 1.15 · COGS                (1.00 · COGS if I / Q_base > 8 weeks: aged-st
 floor > band ceiling  ⇒  P = floor   (flagged)
 ```
 
-### 8.4 Solver
+### 9.4 Solver
 
 - A 401-point grid over the feasible interval finds the global maximum. Π has a kink where the inventory cap binds, so a pure gradient method could stall there.
 - A bounded Brent search (`scipy.optimize.minimize_scalar`) then refines around the best grid point.
 
-### 8.5 Uncertainty band on P*
+### 9.5 Uncertainty band on P*
 
 - Draw 200 elasticities ε ~ N(ε̂, se) (seeded, clipped to [−5, −0.05]) and re-solve for each draw.
 - The 5th–95th percentile of the resulting P* values is reported.
 - This answers "how far would the recommendation move if the elasticity were mis-estimated?"
 
-### 8.6 Outputs per decision
+### 9.6 Outputs per decision
 
 - P* with its 90% band, and the feasible band.
 - Q at the status-quo price and at P*.
@@ -365,7 +433,7 @@ floor > band ceiling  ⇒  P = floor   (flagged)
 - Working capital freed: (Q* − Q_base) · COGS, i.e. inventory converted to cash this week.
 - Flags: aged, floor binding, band overridden.
 
-### 8.7 The Lerner discount test
+### 9.7 The Lerner discount test
 
 With Π = Q(P)·(aP − c), where a = 1 − fee and c = COGS + s·F, and constant ε:
 
@@ -375,51 +443,133 @@ dΠ/dP < 0   ⇔   |ε| > aP / (aP − c) = 1 / m,     m = CM2 / net revenue
 
 A price cut adds CM2 **only if demand is more elastic than 1/m**. If CM2 ≤ 0, no elasticity makes a cut profitable. `finance.breakeven_elasticity()` computes this threshold for every SKU; the dashboard shows it, and a test checks it against the numerical gradient.
 
+### 9.8 Scope of Phase 4
+
+Phase 4 is deliberately a **one-week** decision, because that is the weekly repricing cadence. It sees the future only through the carrying-cost term. Questions that span a season, such as "price high now and risk a write-down later, or clear stock early?", are the job of Phase 5A, which uses Phase 4 as one of its benchmarks.
+
 ---
 
-## 9. Phase 5: the interactive dashboard
+## 10. Phase 5: AI decision layer
+
+Phase 5 adds three AI components on top of the causal core. Each is judged with the same financial lens as Phases 2–4.
+
+| Component | Builds on | Adds |
+|---|---|---|
+| **5A** Reinforcement-learning pricing agent | Phase 3 elasticity posterior, Phase 4 guardrails | Multi-week price paths for a lot of stock under elasticity uncertainty |
+| **5B** GenAI time-series foundation models | Phase 2 protocol | Calibrated demand distributions → inventory capital and working-capital-at-risk |
+| **5C** LLM-coded customer voice | Phase 1 panel, Phase 3 DML | Review text as causal confounders and moderators |
+
+### 10.1 Phase 5A: reinforcement-learning sell-through pricing (`engine/rl.py`)
+
+**Decision problem.** A seller holds a lot of stock and has a 26-week season to sell it. Each week they choose a price, trading margin now against the risk of a write-down later.
+
+- **Season:** a fixed lot, a 26-week season and no replenishment.
+- **Leftover stock:** anything unsold at the end goes to an outlet at 50% of cost. That is booked as a write-down of 50% of COGS, consistent with CM2, which already charges COGS on each unit sold.
+- **Price moves:** each week the price moves on a lattice P0·√1.15^k, at most two steps (±15%) per week.
+- **Price limits:** the Phase 0 margin floor always applies (relaxed to break-even once stock is aged). Prices are capped at +42%, the edge of the range in which elasticity was identified.
+- **Demand:** negative binomial with mean q_base·(P/P0)^ε and dispersion 3, matching the lumpy weekly counts in the data.
+- **Reward:** CM2 on units sold − SELIC-linked carrying cost − the end-of-season write-down, discounted at the weekly SELIC.
+- **Learning while earning:** the true ε is drawn from the Phase 3 posterior and is *not* shown to the agent. The environment keeps an exact Bayesian posterior over ε on a grid, updated each week from observed sales, and correctly handles weeks where the agent sold out, because then demand was higher than the sales it saw. The agent sees the posterior mean and std, so trying a price to learn from the response has value it can discover.
+
+**Agent.**
+- **Algorithm and network:** one PPO policy (stable-baselines3, a 2×128 MLP) prices *every* SKU in the catalogue.
+- **What it sees:** stock, time left, current price level, its elasticity belief, margin structure, cost of capital and recent sales.
+- **Training:** 2M steps, about 4.5 minutes on a Mac CPU.
+- **Training variety:** SELIC is drawn from 6.5–15% and stock from 4–52 weeks of supply. SKUs are sampled **evenly across elasticity regimes**: highly elastic SKUs are rare in the catalogue but are where pricing decisions matter most, so uniform sampling would under-train exactly the hardest cases.
+
+**Benchmarks.** Every policy is run on identical demand scenarios (common random numbers): 72 SKUs × 30 seasons, SELIC 6.5%.
+
+| Policy | What it is |
+|---|---|
+| status quo | hold today's price all season |
+| myopic (Phase 4) | the Phase 4 optimiser, re-solved each week |
+| CE-DP | exact dynamic programme that treats the estimated ε as true |
+| **PPO agent** | the RL policy |
+| oracle DP | exact DP that *knows* the true ε, an upper bound in expectation |
+
+The exact DP is tractable here because the state is small (stock × week × price level). It certifies how close the learned policy gets to optimal. The PPO network is the scalable form of the same decision rule: one model for the whole catalogue, with room for richer state.
+
+Results: §12.4.
+
+### 10.2 Phase 5B: GenAI foundation models vs LightGBM, probabilistic (`engine/foundation.py`)
+
+**Question.** Does a pretrained "GPT for time series" beat a model trained on our own data, and what does the answer mean for working capital?
+
+**Models**, all producing one-week-ahead q10/q50/q90 quantiles on the Phase 2 walk-forward protocol:
+- **Chronos-Bolt-small** (zero-shot, univariate);
+- **Chronos-2** (zero-shot, with past/future covariates: posted log-price, holiday flags, truckers' strike, SELIC, category velocity);
+- **LightGBM quantile regression** (pinball loss), refit at each origin.
+
+A cross-learning variant of Chronos-2 (series batched by forecast week to stay leakage-safe) was also scored.
+
+**Financial test (newsvendor backtest).** Each week, stock up to ⌈q90⌉:
+- realised stockout margin loss;
+- excess carrying cost;
+- fill rate;
+- average inventory capital;
+- **Working-Capital-at-Risk (90%)** = Σ(q90 − q50)·COGS, the capital that buys the last 40 points of service level. This is only meaningful if q90 is calibrated, so coverage is reported too.
+
+Results: §12.5.
+
+### 10.3 Phase 5C: LLM-coded customer voice in the causal model (`engine/reviews.py`)
+
+**Hypothesis.** Customer perception (quality, value, delivery) drives demand, and sellers price in response to it. Perception would then be a confounder in Phase 3, and possibly a moderator of price sensitivity. About 3.4k written Portuguese reviews of the panel's SKUs carry this signal.
+
+**Coding.**
+- **Model and taxonomy:** Claude (Haiku, via `claude -p`) codes each review into 9 themes plus a sentiment score in −1/0/1. The themes are value_good, price_high, quality_good, quality_bad, delivery_fast, delivery_late, wrong_or_missing, service_bad and recommend.
+- **Batching and caching:** 3,351 unique reviews in 34 batched calls. Labels are cached in `data/labels/review_labels.jsonl`, so results are reproducible without re-querying.
+- **Validation:** the LLM never sees the star ratings, so agreement with them is an independent accuracy check.
+
+**Leakage-safe features.**
+- At week t, a SKU "knows" only reviews created before t's Monday; a review written during week w is visible from w+1.
+- Shares are smoothed toward the catalogue mean with 5 pseudo-reviews, so a SKU with two reviews does not get a 0% or 100% signal.
+- Derived signal: `value_perception = value_good − price_high`.
+
+**Uses.**
+1. **Confounders:** the Phase 3 DML is re-estimated with the voice signals added to X.
+2. **Moderators:** `moderation()` tests whether price sensitivity varies with value perception, quality complaints, late-delivery complaints and sentiment. Four tests, so the Bonferroni 5% threshold is |z| > 2.50.
+
+Results: §12.6.
+
+---
+
+## 11. Phase 6: interactive dashboard
 
 `app.py` → `uv run streamlit run app.py`
 
-The app reads only the precomputed artifacts (`st.cache_data`). Each interaction re-solves one SKU's price problem and its 200 uncertainty draws in about **10 ms**, which is displayed in the footer and asserted below 200 ms by a test.
+The app reads only precomputed artifacts (`st.cache_data`; the PPO policy via `st.cache_resource`). A pricing interaction re-solves one SKU's price problem and its 200 uncertainty draws in about **10 ms**; this is displayed in the footer and asserted below 200 ms by a test.
 
-**Sidebar controls**
+**Sidebar controls (shared by all tabs)**
 - Category, and a SKU picker labelled with its elasticity and forecast weekly units.
 - Current inventory (default: 4 weeks of forecast supply).
 - WACC / cost-of-capital slider, 5–20% (default: SELIC in the decision week, 6.5%); the 6% storage spread is added on top.
 - Strategy toggle: *Margin Maximization (EBITDA)* or *Aggressive Cash Recovery (Liquidity)*.
 - Expander with the platform fee and the share of freight borne by the seller.
 
-**Tab 1: Pricing simulator**
-- **KPI cards:** recommended price vs status quo, projected CM2 gain (R$ and %), DSI change, working capital freed.
-- **Diagnostics line:**
-  - causal ε with its 95% interval and regime;
-  - the Lerner breakeven ε*;
-  - the feasible band and the P* 90% interval;
-  - warning flags for aged stock, floor overriding the band, and a sign-restricted elasticity.
-- **"The causal sweet spot":** two stacked panels sharing a price axis.
-  - Profit Π(P) on top, demand Q(P) below, each with its 90% elasticity-uncertainty band.
-  - Marked: the feasible band (shaded), the status-quo price, P*, and the active floor.
-  - The panels are stacked rather than overlaid with two y-axes, so neither scale distorts the other.
-- **P&L bridge (waterfall):** baseline profit → elasticity pricing gain → avoided holding cost → optimised net profit, plus a status-quo vs optimised table.
+| Tab | Phase | Content |
+|---|---|---|
+| **Pricing simulator** | 4 | KPI cards (recommended price, CM2 gain, DSI change, working capital freed); causal ε, Lerner breakeven, feasible band and P* interval with guardrail flags; "causal sweet spot" profit and demand curves with 90% uncertainty bands; P&L waterfall |
+| **RL agent** | 5A | Weeks-of-supply, elasticity-surprise and scenario controls; expected NPV, sell-through and price per policy over 40 shared demand scenarios; price and stock paths for one illustrative scenario; the out-of-sample shortfall-to-oracle chart |
+| **GenAI forecast** | 5B | Per-model scorecards (WQL, fill rate, inventory capital, calibration); fan chart of q10–q90 vs actuals for the selected SKU; the full probabilistic and newsvendor table |
+| **Customer voice** | 5C | Theme prevalence by category; DML with vs without review confounders; moderation results; the selected SKU's latest reviews with their LLM tags |
+| **Portfolio** | 4 | Precomputed recommendations for all 72 live SKUs under 2 inventory scenarios × 2 strategy modes |
+| **Model evidence** | 2–3 | Naive OLS vs Double-ML elasticities with 95% intervals; the point-forecast financial scorecard |
 
-**Tab 2: Portfolio.** Precomputed recommendations for all 72 SKUs live in the decision week:
-- under two inventory scenarios (4 and 12 weeks of supply) × two strategy modes;
-- portfolio totals, a per-category summary, and a sortable SKU table.
+**Demo path for judges.**
+1. **Pricing simulator:** show the Lerner test, then raise WACC and inventory with the liquidity mode on to watch cuts appear.
+2. **RL agent:** pick bed_bath_table SKU `704ef63a` with 40 weeks of supply, where planning ahead beats the one-week optimiser.
+3. **GenAI forecast:** compare inventory capital across the models.
+4. **Customer voice:** show the confounding shift.
 
-**Tab 3: Model evidence**
-- Naive within-SKU OLS vs Double-ML elasticities by category, with 95% intervals.
-- The forecast scorecard with its financial columns.
-
-Colours follow a validated, colour-blind-checked reference palette: blue and orange for the two series, green and red reserved for good and bad outcomes.
+Colours follow a validated, colour-blind-checked reference palette. Each policy, model and category keeps a fixed colour across all tabs, and green and red are reserved for good and bad outcomes.
 
 ---
 
-## 10. Results
+## 12. Results
 
 All figures are from `reports/results.md` and are regenerated on every pipeline run.
 
-### 10.1 Forecasting (walk-forward hold-out, Mar–Aug 2018)
+### 12.1 Phase 2: forecasting (walk-forward hold-out, Mar–Aug 2018)
 
 | Model | RMSE | MAE | WAPE | Bias ratio | Stockout loss | Excess holding | Safety-stock capital |
 |---|---|---|---|---|---|---|---|
@@ -429,9 +579,9 @@ All figures are from `reports/results.md` and are regenerated on every pipeline 
 
 - **Financial reading.** Replacing Seasonal-Naive with LightGBM cuts forgone margin on stockouts by **R$ 13,271 (−39%)** and releases **R$ 6,702 (−28%)** of safety-stock working capital.
 - **Asymmetric costs.** Excess-holding cost is about 100× smaller than stockout loss. With a newsvendor critical ratio CM2/(CM2+h) close to 1, under-forecasting is the expensive error. LightGBM's −8.8% bias ratio points to a cheap next step: shade forecasts upward.
-- **SARIMAX.** It does no better than the naive benchmark on short, sparse, zero-heavy series. That is itself a useful finding.
+- **SARIMAX.** It does no better than the naive benchmark on short, sparse, zero-heavy series.
 
-### 10.2 Causal elasticity
+### 12.2 Phase 3: causal elasticity
 
 Coefficient on ln P, outcome ln(Q+1):
 
@@ -449,7 +599,7 @@ After de-attenuation and shrinkage, the median SKU elasticity is −1.61 (bed_ba
 
 **Finding.** The confounding bias runs the opposite way to the textbook "sellers raise prices into peaks" story. On Olist, sellers **discount into demand peaks** (Black Friday, platform growth), so naive OLS **overstates** price sensitivity by about 3×. Pooled OLS even has the wrong sign. An engine that priced off the naive estimate would systematically over-discount and give away gross margin.
 
-### 10.3 Optimisation: 72 live SKUs, decision week 2018-08-20 (model-implied, R$/week)
+### 12.3 Phase 4: one-week optimisation, 72 live SKUs, decision week 2018-08-20 (model-implied, R$/week)
 
 | Scenario | Mode | Profit before → after | CM2 before → after | Median DSI before → after |
 |---|---|---|---|---|
@@ -470,72 +620,24 @@ After de-attenuation and shrinkage, the median SKU elasticity is −1.61 (bed_ba
 **Headline.**
 - Thin CM2 margins make discounting value-destroying. A price cut pays only if demand is 4–9× more elastic than the data shows, so the engine moves nearly every SKU to the **+15% volatility cap**. That cap, not the economics, is what binds.
 - The trade-off is explicit: higher prices slow sell-through, so DSI rises a few days and working capital freed is negative (about −R$ 380/week).
-- Price cuts appear only when carrying cost becomes material: high WACC, heavy overstock, liquidity mode. The dashboard sliders demonstrate this live.
+- Price cuts appear only when carrying cost becomes material: high WACC, heavy overstock, liquidity mode. That is exactly the regime Phase 5A plans for.
 
----
+### 12.4 Phase 5A: RL sell-through pricing (26-week season, SELIC 6.5%)
 
-## 11. AI extensions: RL agent, GenAI forecasting, LLM review mining
+Mean season NPV per lot in R$, with the shortfall vs the oracle in brackets:
 
-Each extension fixes a specific weakness of the core engine and is judged with the same financial lens.
-
-### 11.1 Reinforcement-learning pricing agent (`engine/rl.py`)
-
-**Weakness addressed.** The Phase-4 optimiser is myopic: it only maximises *this week's* profit. A real seller holding a lot of stock faces a *sequence* of prices: hold the price high and risk being stuck with stock, or discount and give margin away?
-
-**The problem the agent solves.**
-- **Season:** a fixed lot of stock, a 26-week season and no replenishment.
-- **Leftover stock:** anything unsold at the end goes to an outlet at 50% of cost. That is booked as a write-down of 50% of COGS, consistent with CM2, which already charges COGS on each unit sold.
-- **Price moves:** each week the price moves on a lattice P0·√1.15^k, at most two steps (±15%) per week.
-- **Price limits:** the margin floor always applies (relaxed to break-even once stock is aged). Prices are capped at +42%, the edge of the range in which elasticity was identified.
-- **Demand:** negative binomial with mean q_base·(P/P0)^ε and dispersion 3, matching the lumpy weekly counts in the data.
-- **Reward:** CM2 on units sold − SELIC-linked carrying cost − the end-of-season write-down, discounted at the weekly SELIC.
-- **Learning while earning:** the true ε is drawn from the Double-ML posterior and is *not* shown to the agent. The environment keeps an exact Bayesian posterior over ε on a grid, updated each week from observed sales, and correctly handles weeks where the agent sold out, because then demand was higher than the sales it saw. The agent sees the posterior mean and std, so trying a price to learn from the response has value it can discover.
-
-**The agent.**
-- **Algorithm and network:** one PPO policy (stable-baselines3, a 2×128 MLP) prices *every* SKU in the catalogue.
-- **What it sees:** stock, time left, current price level, its elasticity belief, margin structure, cost of capital and recent sales.
-- **Training:** 2M steps, about 4.5 minutes on a Mac CPU.
-- **Training variety:** SKUs are sampled evenly across elasticity regimes (highly elastic SKUs are rare but matter most). SELIC is drawn from 6.5–15% and stock from 4–52 weeks of supply.
-
-**Benchmarks.** Every policy is run on identical demand scenarios (common random numbers): 72 SKUs × 30 seasons, SELIC 6.5%.
-
-| Policy | What it is |
-|---|---|
-| status quo | hold today's price all season |
-| myopic (Phase 4) | the core engine, re-solved each week |
-| CE-DP | exact dynamic programme that treats the estimated ε as true |
-| **PPO agent** | the RL policy |
-| oracle DP | exact DP that *knows* the true ε, an upper bound in expectation |
-
-**Results** (mean season NPV per lot in R$; shortfall vs oracle in brackets):
-
-| Stock regime | Status quo | Myopic | CE-DP | **PPO** | Oracle |
+| Stock regime | Status quo | Myopic (Phase 4) | CE-DP | **PPO agent** | Oracle DP |
 |---|---|---|---|---|---|
 | lean (< 13 wks supply) | 75.8 (−250.9) | 322.0 (−4.7) | 325.9 (−0.8) | **326.2 (−0.6)** | 326.7 |
 | full (13–26 wks) | 111.5 (−393.1) | 493.4 (−11.1) | 499.7 (−4.9) | **497.9 (−6.7)** | 504.6 |
 | overstock (> 26 wks) | −203.8 (−287.2) | 58.6 (−24.8) | 61.8 (−21.6) | **61.8 (−21.7)** | 83.4 |
 
-**Reading.**
-1. **One network nearly matches the exact optimum.** A single network for the whole catalogue matches the exact DP on lean and overstocked lots and is within R$2 per lot on full ones. It beats the myopic engine in every regime. The DP needs a known model and a small state space, while the network scales to richer state.
-2. **The price of not knowing ε.** With overstock, even the best realistic policy leaves about **R$22 per lot (≈ 26% of NPV)** below the oracle. That gap is the value of perfect elasticity information, i.e. an upper bound on what a price experiment is worth.
-3. **Holding today's price is ruinous when overstocked.** It turns a +R$62 season into a −R$204 one.
-4. **Iteration history.** The first agent (600k steps, uniform SKU sampling) was weak on the 9 highly elastic SKUs (−R$15.8 vs CE-DP) and lost to the status quo on 3 SKUs. Balanced sampling and 2M steps cut that to −R$2.2 and 1 SKU. On 18 individual SKUs it still trails the myopic engine by small amounts, though it wins in aggregate.
+1. **One network nearly matches the exact optimum.** A single network for the whole catalogue matches the exact DP on lean and overstocked lots and is within R$2 per lot on full ones. It beats the one-week Phase 4 optimiser in every regime.
+2. **Highly elastic SKUs.** On the 9 SKUs with ε < −2 it is within R$2.2 per lot of the exact DP. It falls short of holding today's price on 1 of 72 SKUs, and trails the myopic optimiser on 18 individual SKUs by small amounts while winning in aggregate.
+3. **The price of not knowing ε.** With overstock, even the best realistic policy leaves about **R$22 per lot (≈ 26% of NPV)** below the oracle. That gap is the value of perfect elasticity information, i.e. an upper bound on what a price experiment is worth.
+4. **Holding today's price is ruinous when overstocked.** It turns a +R$62 season into a −R$204 one.
 
-### 11.2 GenAI time-series foundation models vs LightGBM (`engine/foundation.py`)
-
-**Question.** Does a pretrained "GPT for time series" beat a model trained on our own data, and what does the answer mean for working capital?
-
-**Models**, all producing one-week-ahead q10/q50/q90 quantiles on the same walk-forward split as Phase 2:
-- **Chronos-Bolt-small** (zero-shot, univariate);
-- **Chronos-2** (zero-shot, with past/future covariates: posted log-price, holiday flags, truckers' strike, SELIC, category velocity);
-- **LightGBM quantile regression** (pinball loss), refit at each origin.
-
-**Financial test (newsvendor backtest).** Each week, stock up to ⌈q90⌉:
-- realised stockout margin loss;
-- excess carrying cost;
-- fill rate;
-- average inventory capital;
-- **Working-Capital-at-Risk (90%)** = Σ(q90 − q50)·COGS, the capital that buys the last 40 points of service level. This is only meaningful if q90 is calibrated, so coverage is reported too.
+### 12.5 Phase 5B: probabilistic forecasting and working capital
 
 | Model | WQL ↓ | WAPE (median) | P(sales ≤ q90) | Fill rate | Avg inventory capital / wk | WC-at-Risk 90 / wk |
 |---|---|---|---|---|---|---|
@@ -543,29 +645,18 @@ Each extension fixes a specific weakness of the core engine and is judged with t
 | Chronos-2 + covariates (zero-shot) | 0.570 | 87.0% | 89% | 90.1% | R$ 27,845 | R$ 17,603 |
 | **LightGBM quantile** | **0.377** | **56.2%** | 92% | 88.0% | **R$ 19,667** | **R$ 9,037** |
 
-**Reading.**
 - On sparse, lumpy marketplace demand, the domain-trained model wins clearly.
 - The foundation models buy 1–2 points more fill rate by holding **about 40% more inventory capital** (R$8.2k a week more), because their intervals are wider.
-- Covariates and a cross-learning variant (batched by forecast week to stay leakage-safe; WQL 0.572) did not close the gap.
+- Covariates and cross-learning (WQL 0.572) did not close the gap.
 - So GenAI is not free: its generality shows up on the balance sheet.
 
-### 11.3 LLM-coded customer voice in the causal model (`engine/reviews.py`)
+### 12.6 Phase 5C: customer voice
 
-**Weakness addressed.** About 3.4k written Portuguese reviews of our SKUs were unused. Customer perception (quality, value, delivery) plausibly drives both demand and the seller's pricing, which would make it a hidden confounder.
+**LLM validation.** Sentiment matches star polarity for **87.7%** of 1–2-star and 4–5-star reviews (95% of 1-star reviews coded negative, 93% of 5-star positive).
 
-**Coding.**
-- **Model and taxonomy:** Claude (Haiku, via `claude -p`) codes each review into 9 themes plus a sentiment score in −1/0/1. The themes are value_good, price_high, quality_good, quality_bad, delivery_fast, delivery_late, wrong_or_missing, service_bad and recommend.
-- **Batching and caching:** 3,351 unique reviews in 34 batched calls. Labels are cached in `data/labels/review_labels.jsonl`, so results are reproducible without re-querying.
-- **Validation:** the LLM never saw the star ratings, yet its sentiment matches star polarity for **87.7%** of 1–2-star and 4–5-star reviews (95% of 1-star reviews coded negative, 93% of 5-star positive).
+**Confounding.**
 
-**Leakage-safe features.**
-- At week t, a SKU "knows" only reviews created before t's Monday; a review written during week w is visible from w+1.
-- Shares are smoothed toward the catalogue mean with 5 pseudo-reviews.
-- Derived signal: `value_perception = value_good − price_high`.
-
-**Results.**
-
-| Category | DML θ | DML θ + review confounders |
+| Category | DML θ (Phase 3) | DML θ + review confounders |
 |---|---|---|
 | All | −0.34 | **−0.45** |
 | bed_bath_table | −0.57 | −0.50 |
@@ -573,55 +664,64 @@ Each extension fixes a specific weakness of the core engine and is judged with t
 | telephony | −0.11 | −0.07 |
 | watches_gifts | −0.54 | **−0.79** |
 
-- **Perception is a confounder.** Controlling for it makes demand about 30% more price-sensitive overall, and roughly 2× more for computer accessories. Customer perception had been pulling the estimates toward zero.
-- **Moderation** (the change in θ per 1 SD of each signal, SKU-clustered SEs, 4 tests so the Bonferroni threshold is |z| > 2.50):
-  - value perception: +0.11 (z = 1.33), the expected direction (good value → less price-sensitive) but not significant, because only about 3% of reviews discuss price at all;
-  - quality complaints: +0.17 (z = 2.25), not significant after the multiple-testing correction.
-- **Pricing still uses the original elasticities.** The review-adjusted estimates are reported as an extension. Adopting them would make the engine somewhat more cautious about price rises.
+Controlling for perception makes demand about 30% more price-sensitive overall, and roughly 2× more for computer accessories. Customer perception was pulling the Phase 3 estimates toward zero.
 
-### 11.4 Engineering note: PyTorch and LightGBM on macOS
+**Moderation** (change in θ per 1 SD of each signal; positive = less price-sensitive):
 
-PyTorch (Chronos, PPO) and LightGBM ship different OpenMP runtimes, and on macOS combining them in one process segfaults or deadlocks. The code therefore keeps them apart:
-- the pipeline runs Chronos and the RL agent as **separate processes**;
-- the Streamlit app never imports LightGBM;
-- the app test runs in its own subprocess.
+| Signal | θ₁ per SD | z |
+|---|---|---|
+| value perception | +0.11 | 1.33 |
+| quality complaints | +0.17 | 2.25 |
+| late-delivery complaints | −0.04 | −0.49 |
+| sentiment | −0.06 | −0.84 |
+
+- **Value perception** points the expected way (good value → less price-sensitive) but is not significant: only about 3% of reviews discuss price at all.
+- **No moderator** clears the Bonferroni threshold.
+- **Pricing still uses the Phase 3 elasticities.** The review-adjusted estimates serve as a sensitivity analysis; adopting them would make the engine somewhat more cautious about price rises.
 
 ---
 
-## 12. Tests
+## 13. Tests
 
 `uv run pytest`: 36 tests, about 9 s.
 
-| Test | What it guarantees |
-|---|---|
-| `test_unit_economics` | CM2 and h_t formulas |
-| `test_guardrails_hold` (24 cases: ε × mode × inventory) | P* ≥ active floor; P* inside the band unless the band is overridden; P* never worse than the status quo; aged flag exactly when weeks-of-supply > 8 |
-| `test_floor_overrides_band_for_underwater_sku` | Loss-prevention priority |
-| `test_lerner_breakeven_matches_gradient` | Analytical breakeven ε* matches the sign of the numerical profit gradient |
-| `test_forecast_features_do_not_leak_current_sales` | A price change becomes visible to the forecaster only the following week |
-| `test_app_runs_and_solves_fast` | All six tabs run headless (Streamlit `AppTest`, in a subprocess) without exceptions; a WACC change re-solves in under 200 ms |
-| `test_env_respects_guardrails` (4 cases) | Under random actions the RL environment never breaks the floor, the +42% cap or the ±15% band (unless the floor forces a jump) |
-| `test_dp_dominates_myopic_in_expectation` | Over 300 shared demand scenarios, the exact DP earns at least the myopic policy's NPV |
-| `test_unsold_stock_books_a_writedown` | Unsold stock costs (1 − salvage)·COGS, never a phantom gain |
-| `test_review_features_are_leakage_safe` | A review becomes visible only the week after it is written |
-
----
-
-## 13. Deviations from the original specification
-
-| Spec said | What was done | Why |
+| Test | Phase | What it guarantees |
 |---|---|---|
-| EconML `LinearDML` *or* FWL partialling-out | Hand-written FWL Double ML with LightGBM nuisances | Transparent, no Python-version constraints, and adds SKU fixed effects, blocked cross-fitting and clustered SEs explicitly |
-| Elasticity from ln(Q+1) | The ln(Q+1) slope θ is converted to ε = θ·(Q̄+1)/Q̄ | Plugging θ into Q = Q_base·(P/P_base)^ε would understate sensitivity by about half at these volumes |
-| Seasonal-Naive with lag 52 | Lag 52, falling back to the 4-week mean | Most SKUs did not exist 52 weeks earlier |
-| SARIMAX "with seasonality" | ARIMA(1,0,1) plus Fourier exogenous terms | Under two years of weekly data cannot identify a seasonal AR(52) term |
-| Liquidity vs EBITDA toggle (unspecified mechanics) | Liquidity mode charges carry until sell-through | Gives the toggle a precise corporate-finance meaning (remaining cash-conversion cycle) |
-| Floor and band both hard | Floor overrides band when they conflict | The two constraints can be mutually infeasible; loss prevention takes priority |
-| — (added) | Lerner breakeven elasticity per SKU | Explains *why* the optimiser recommends what it does |
+| `test_unit_economics` | 1 | CM2 and h_t formulas |
+| `test_forecast_features_do_not_leak_current_sales` | 2 | A price change becomes visible to the forecaster only the following week |
+| `test_guardrails_hold` (24 cases: ε × mode × inventory) | 4 | P* ≥ active floor; P* inside the band unless the band is overridden; P* never worse than the status quo; aged flag exactly when weeks-of-supply > 8 |
+| `test_floor_overrides_band_for_underwater_sku` | 4 | Loss-prevention priority |
+| `test_lerner_breakeven_matches_gradient` | 4 | Analytical breakeven ε* matches the sign of the numerical profit gradient |
+| `test_env_respects_guardrails` (4 cases) | 5A | Under random actions the RL environment never breaks the floor, the +42% cap or the ±15% band (unless the floor forces a jump) |
+| `test_dp_dominates_myopic_in_expectation` | 5A | Over 300 shared demand scenarios, the exact DP earns at least the myopic policy's NPV |
+| `test_unsold_stock_books_a_writedown` | 5A | Unsold stock costs (1 − salvage)·COGS, never a phantom gain |
+| `test_review_features_are_leakage_safe` | 5C | A review becomes visible only the week after it is written |
+| `test_app_runs_and_solves_fast` | 6 | All six tabs run headless (Streamlit `AppTest`, in a subprocess) without exceptions; a WACC change re-solves in under 200 ms |
 
 ---
 
-## 14. Limitations and honest caveats
+## 14. Design decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Causal estimator | Hand-written FWL Double ML with LightGBM nuisances (rather than EconML) | Transparent; adds SKU fixed effects, blocked cross-fitting and clustered SEs explicitly; the same residuals power the moderation tests |
+| Elasticity units | ln(Q+1) slope θ converted to ε = θ·(Q̄+1)/Q̄ | Plugging θ into Q = Q_base·(P/P_base)^ε would understate sensitivity by about half at these volumes |
+| Seasonal baseline | Lag 52, falling back to the 4-week mean | Most SKUs did not exist 52 weeks earlier |
+| SARIMAX seasonality | ARIMA(1,0,1) plus Fourier exogenous terms | Under two years of weekly data cannot identify a seasonal AR(52) term |
+| Liquidity vs EBITDA mode | Liquidity mode charges carry until sell-through | Gives the toggle a precise corporate-finance meaning (remaining cash-conversion cycle) |
+| Conflicting guardrails | Floor overrides band | The two constraints can be mutually infeasible; loss prevention takes priority |
+| Explaining recommendations | Lerner breakeven elasticity per SKU | Shows *why* the optimiser recommends what it does |
+| One-week vs season pricing | Phase 4 for the weekly decision, Phase 5A for the season | Keeps the weekly engine simple and fast while handling write-down risk where it matters |
+| RL validation | Exact DP benchmarks (with estimated and true ε) | Certifies near-optimality instead of only comparing against heuristics |
+| RL training distribution | SKUs balanced across elasticity regimes; SELIC 6.5–15%; 4–52 weeks of supply | Covers rare but decision-critical cases and macro regimes beyond the sample |
+| Unsold stock accounting | Write-down of (1 − salvage)·COGS | Consistent with CM2, which books COGS only on units sold |
+| Probabilistic evaluation | Newsvendor backtest at q90 + Working-Capital-at-Risk | Converts calibration into balance-sheet terms |
+| LLM labelling | Batched Claude Haiku calls, cached labels, star-rating validation | Cheap, reproducible, independently checked |
+| Process isolation | PyTorch stages in separate processes | PyTorch and LightGBM cannot share a macOS process |
+
+---
+
+## 15. Limitations and honest caveats
 
 1. **COGS is synthesised** from sector benchmarks, not observed. Every CM2 figure inherits this assumption, which is why the dashboard exposes the fee and freight assumptions as sliders.
 2. **Freight treatment matters a lot.** The CM2 definition charges the full freight to the seller; on Olist the customer often pays it. With seller freight share = 0, electronics are no longer CM2-negative.
@@ -638,7 +738,7 @@ PyTorch (Chronos, PPO) and LightGBM ship different OpenMP runtimes, and on macOS
 
 ---
 
-## 15. Glossary
+## 16. Glossary
 
 | Term | Meaning |
 |---|---|

@@ -184,8 +184,12 @@ def attach_customer_voice(panel: pd.DataFrame) -> pd.DataFrame:
 
 def write_ai_report(cat: pd.DataFrame, cat_v: pd.DataFrame | None, mod: pd.DataFrame | None,
                     pm: pd.DataFrame, rl: pd.DataFrame) -> None:
-    """Append the AI-extension sections to reports/results.md."""
-    parts = ["\n## 5. GenAI time-series foundation models vs LightGBM (probabilistic, walk-forward)\n",
+    """Append the Phase 5 sections to reports/results.md."""
+    parts = ["\n## 5A. Phase 5A: reinforcement-learning sell-through pricing (26-week season, SELIC 6.5%)\n",
+             _md(rl_summary(rl), ".2f"),
+             "\n`gap_to_oracle`: mean NPV shortfall (R$) versus the exact DP that knows the true "
+             "elasticity. `roi` = total NPV / inventory capital at cost.\n"]
+    parts += ["\n## 5B. Phase 5B: GenAI foundation models vs LightGBM (probabilistic, walk-forward)\n",
              _md(pm),
              "\nOrder-up-to-q90 newsvendor backtest. `avg_capital_brl_wk` = mean weekly stock value at "
              "COGS; `wc_at_risk_90` = sum (q90 - q50) x COGS, the capital buying the last 40 points of "
@@ -193,7 +197,7 @@ def write_ai_report(cat: pd.DataFrame, cat_v: pd.DataFrame | None, mod: pd.DataF
     if cat_v is not None:
         cmp = cat[["cat_en", "eps_dml", "se_dml"]].merge(
             cat_v[["cat_en", "eps_dml", "se_dml"]], on="cat_en", suffixes=("", "_with_reviews"))
-        parts += ["\n## 6. LLM-coded customer voice in the causal model\n",
+        parts += ["\n## 5C. Phase 5C: LLM-coded customer voice in the causal model\n",
                   "DML elasticity with and without review-derived confounders:\n", _md(cmp),
                   "\nModeration: change in the ln(Q+1) price coefficient per 1 SD of each review "
                   "signal (positive = less price-sensitive). Four moderators are tested, so the "
@@ -204,10 +208,6 @@ def write_ai_report(cat: pd.DataFrame, cat_v: pd.DataFrame | None, mod: pd.DataF
         parts += [f"\nLLM validation against star ratings (which the LLM never saw): sentiment matches "
                   f"the star polarity for {(lab['sentiment'] == stars)[stars != 0].mean():.1%} of 1-2 and "
                   f"4-5 star reviews. Row shares by star rating:\n", _md(agree.reset_index(), ".2f")]
-    parts += ["\n## 7. Reinforcement-learning sell-through pricing (26-week season, SELIC 6.5%)\n",
-              _md(rl_summary(rl), ".2f"),
-              "\n`gap_to_oracle`: mean NPV shortfall (R$) versus the exact DP that knows the true "
-              "elasticity. `roi` = total NPV / inventory capital at cost.\n"]
     with (REPORT_DIR / "results.md").open("a") as f:
         f.write("\n".join(parts))
 
@@ -240,7 +240,7 @@ def main() -> None:
 
     write_report(metrics, cat, cat_rob, sku, rec, panel, state)
 
-    # ---- AI extensions ---------------------------------------------------
+    # ---- Phase 5: AI decision layer --------------------------------------
     voice_cols = [c for c in panel.columns if c.startswith("voice_")] + ["value_perception"]
     if voice_cols[-1] in panel:
         cat_v, _, res_v = run_dml(panel, extra_confounders=voice_cols)
@@ -248,23 +248,23 @@ def main() -> None:
         mod = moderation(res_v, ["value_perception", "voice_quality_bad", "voice_delivery_late",
                                  "voice_sentiment"])
         mod.to_parquet(ARTIFACT_DIR / "moderation.parquet")
-        print(f"[5] customer-voice DML ({time.time() - t0:.0f}s)\n{mod.round(3).to_string()}")
+        print(f"[5C] customer-voice DML ({time.time() - t0:.0f}s)\n{mod.round(3).to_string()}")
     else:
         cat_v = mod = None
-        print("[5] skipped: no review labels (run `uv run python -m engine.reviews`)")
+        print("[5C] skipped: no review labels (run `uv run python -m engine.reviews`)")
 
     pf = foundation.run(panel)
     pf.to_parquet(ARTIFACT_DIR / "prob_forecasts.parquet")
     pm = foundation.probabilistic_metrics(pf)
     pm.to_parquet(ARTIFACT_DIR / "prob_metrics.parquet")
-    print(f"[6] probabilistic forecasts ({time.time() - t0:.0f}s)\n{pm.round(3).to_string()}")
+    print(f"[5B] probabilistic forecasts ({time.time() - t0:.0f}s)\n{pm.round(3).to_string()}")
 
     # RL needs torch, which must not share a process with LightGBM training.
     from .rl import MODEL_PATH  # noqa: E402
     args = (["train"] if not MODEL_PATH.exists() else []) + ["eval"]
     subprocess.run([sys.executable, "-m", "engine.rl", *args], check=True, cwd=ROOT)
     rl = pd.read_parquet(ARTIFACT_DIR / "rl_eval.parquet")
-    print(f"[7] RL evaluation ({time.time() - t0:.0f}s)")
+    print(f"[5A] RL evaluation ({time.time() - t0:.0f}s)")
 
     write_ai_report(cat, cat_v, mod, pm, rl)
     print(f"report -> {REPORT_DIR / 'results.md'}")
