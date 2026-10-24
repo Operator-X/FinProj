@@ -3,7 +3,7 @@
     uv run python -m engine.api          -> http://127.0.0.1:8600
 
 Serves web/margem.html with live mode switched on, plus JSON endpoints the page
-calls when the user asks for more ("Simulate", "Race the AI", ...):
+calls when the user asks for more ("Simulate", Season replay "More options", ...):
 
   POST /api/price            Phase 4 optimiser for one SKU under user assumptions
   POST /api/season           Phase 5A: PPO agent vs baselines on any SKU (simulated season)

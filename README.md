@@ -553,7 +553,7 @@ Results: §12.6.
 
 Phase 6 turns the engine into something a seller would open every Monday, and that a judge can understand in 30 seconds. **Where it runs:** **https://operator-x.github.io/margem/** (the poster QR code), or `web/site/index.html` offline. Every feature works there with no server, because the interactive parts of the engine are ported to JavaScript and parity-tested against Python (§11.6). Optionally, `uv run python -m engine.api` serves the same page from a FastAPI server, and then the Scenario lab also confirms its numbers with the Python optimiser.
 
-**Design rule: simple first, more on request.** Every screen opens with one sentence, one number and Capi. Detail appears only when asked for: cards expand into panels; a product page opens three tools (Simulate, Forecast, What buyers say); the Season planner offers "Race the AI on any product".
+**Design rule: simple first, more on request.** Every screen opens with one sentence, one number and Capi. Detail appears only when asked for: cards expand into panels; a product page opens three tools (Simulate, Forecast, What buyers say); the Season planner's replay opens on one featured season, and "More options" reveals stock, demand-surprise controls and the five-strategy table.
 
 ### 11.1 Identity
 
@@ -583,7 +583,7 @@ Every page follows the same formula: a one-sentence headline with an underlined 
 |---|---|---|---|
 | **Overview** | 4 | *"You could earn R$618 more this week."* | Four 2-up live cards (weekly CM2 with a "next week" projection, cash in stock, forecast error, RL uplift); "3 things to do this week" with Approve flows |
 | **Products** | 1, 4 | *"R$7,362 is stuck in products that lose money."* | Capital-traps and cash-machines cards; the capital map (margin × weekly sales × cash), annotated by hand |
-| **Season planner** | 5A | *"Planning ahead turns a −R$204 season into R$62 profit."* | **Season replay** with a product picker: it opens on one featured lot, and any of the 72 products can be chosen and re-simulated in the browser in under 0.1 s. Each replay runs 26 weeks, comparing holding the price, the weekly optimiser and the AI planner on identical demand, with a live scoreboard and a closing verdict; out-of-sample policy chart and table |
+| **Season planner** | 5A | *"Planning ahead turns a −R$204 season into R$62 profit."* | **Season replay** with a product picker: it opens on one featured lot, and any of the 72 products can be chosen and re-simulated in the browser in under 0.1 s; **More options** expands in place to set stock on hand and a demand surprise and adds the exact planner, the oracle and a 40-scenario table. Each replay runs 26 weeks, comparing holding the price, the weekly optimiser and the AI planner on identical demand, with a live scoreboard and a closing verdict; out-of-sample policy chart and table |
 | **Evidence** | 2, 3, 5B | *"A naive model thinks discounts work 2.9× better than they do."* | Naive vs Double-ML bars by category; forecast-error and GenAI-capital cards |
 | **Scenario lab** | 4, 0 | *"At SELIC 15.00% with 20 weeks of stock, the engine cuts 13 prices…"* | Rate presets (Brazil 2016: 14.25%, 2018: 6.50%, 2025: 15.00%); sliders for stock, platform fee and seller-paid shipping; goal toggle (this week's profit or cash recovery). All 72 products re-price live in the browser, using the Phase 4 objective and the Phase 0 guardrails |
 
@@ -618,7 +618,7 @@ The interactive features run in the visitor's browser (the `ENGINE` block of `we
 | Browser feature | Ported from | How it is made identical |
 |---|---|---|
 | Simulate, Scenario lab | `engine/optimize.py` (bounds, profit, 401-point grid + local refinement, uncertainty band) | The 200 elasticity draws are numpy's seeded draws, shipped with the page |
-| Race the AI | `engine/rl.py` (lattice, guardrails, demand, Bayesian elasticity belief, write-down, exact DP) | Negative-binomial pmf/survival/quantile in closed form for dispersion 3; each scenario's uniform draws shipped with the page |
+| Season replay (any product, More options) | `engine/rl.py` (lattice, guardrails, demand, Bayesian elasticity belief, write-down, exact DP) | Negative-binomial pmf/survival/quantile in closed form for dispersion 3; each scenario's uniform draws shipped with the page |
 | The AI agent | The trained PPO network (12→128→128→5, tanh) | Weights exported from the trained model; observations rounded to float32 as in PyTorch |
 | Forecast, What buyers say | `prob_forecasts.parquet`, `review_labels.parquet` | Exported per product into the page |
 
@@ -631,7 +631,7 @@ Page weight: about 0.5 MB of data (half of it the network's weights).
 
 ---|---|---|---|
 | `POST /api/price` | 4 | Product → **Simulate**: stock, cost of capital, goal, fee and seller-paid shipping sliders; best price, profit curve with 90% band, P&L bridge, "why this price" | ~50 ms |
-| `POST /api/season` | 5A | Season planner → **Race the AI on any product**: hold / weekly optimiser / exact planner / PPO agent / oracle on one shown season plus 40-scenario averages, replayed with the same animation | ~2 s |
+| `POST /api/season` | 5A | Season planner → **Season replay** (any product / More options): hold / weekly optimiser / exact planner / PPO agent / oracle on one shown season plus 40-scenario averages, replayed with the same animation | ~2 s |
 | `GET /api/forecast/{sku}` | 5B | Product → **Forecast**: q10–q90 range vs actual units for LightGBM and both Chronos models | instant |
 | `GET /api/reviews/{sku}` | 5C | Product → **What buyers say**: latest reviews with their LLM theme tags | instant |
 | `POST /api/portfolio` | 4 | **Scenario lab**: re-prices all 72 products under the chosen SELIC, stock, fee, shipping and goal | ~70 ms |
@@ -642,7 +642,7 @@ Interactive API docs are at `/api/docs`. The server loads PyTorch for the PPO ag
 - **Evidence → Customer voice:** themes by category, the with/without-review elasticities per category with CIs, and the moderation table with its Bonferroni verdict.
 - **Products → See all 72 products** (a sortable table) and **Batch scenarios** (the pipeline's 4 vs 12 weeks × goal totals).
 - **Product page:** the elasticity regime, its 95% range, and a flag when the product's own estimate had the wrong sign and fell back to its category.
-- **Race the AI** (live): a five-strategy results table and the value of knowing the true elasticity (oracle minus the best realistic strategy).
+- **Season replay → More options:** stock on hand (4–52 weeks), true demand more/less elastic than estimated, a five-strategy results table and the value of knowing the true elasticity (oracle minus the best realistic strategy).
 
 **Scenario lab engine.** The lab runs the in-browser port of `engine/optimize.py` (same bounds, profit, 401-point grid and local refinement) and labels itself that way on screen; when the page is served by the optional Python server it also confirms each scenario with `/api/portfolio`. A parity test runs that port in Node against Python on 4 scenarios × 72 products: every price agrees within R$0.01.
 

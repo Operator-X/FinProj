@@ -165,8 +165,15 @@ body.no-sketch .sketch { display: none !important; }
 .rv small { color: var(--fg-3); }
 .spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--accent); animation: rot .8s linear infinite; display: inline-block; vertical-align: -2px; }
 @keyframes rot { to { transform: rotate(360deg); } }
-.race { padding: 22px 24px; display: flex; flex-direction: column; gap: 16px; }
-.race-ctl { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1.3fr) auto; gap: 14px; align-items: end; }
+.replay-body { display: flex; flex-direction: column; gap: 16px; }
+.more-tog { align-self: flex-start; display: inline-flex; align-items: center; gap: 6px; }
+.more-tog svg { width: 12px; height: 12px; transition: transform .3s cubic-bezier(.2,.8,.2,1); }
+.more-tog[aria-expanded="true"] svg { transform: rotate(180deg); }
+.more { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows .45s cubic-bezier(.2,.8,.2,1), opacity .3s; }
+.more.open { grid-template-rows: 1fr; opacity: 1; }
+.more > div { min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 14px; }
+.more.open > div { padding-top: 2px; }
+.race-ctl { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 14px; align-items: end; }
 .replay-top select.pick { background: var(--panel-2); color: var(--fg); border: 1px solid var(--line-2); border-radius: 8px; padding: 3px 8px; font: inherit; font-size: 14px; font-weight: 600; max-width: 100%; cursor: pointer; }
 .race-ctl select { width: 100%; background: var(--panel-2); color: var(--fg); border: 1px solid var(--line-2); border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px; }
 .sortable th { cursor: pointer; user-select: none; }
@@ -408,7 +415,6 @@ tbody tr:hover td { background: rgba(255,255,255,.03); }
         <span class="hero-sub">For overstocked lots. An AI agent decides each week whether to hold the price or start clearing, and learns how buyers react from its own sales.</span></p>
         <svg class="doodle sketch" data-kind="planner" viewBox="0 0 260 170" aria-hidden="true"></svg></div>
       <section class="block replay" id="replay"></section>
-      <section class="block race" id="race"></section>
       <div class="pane" id="plannerBody"></div>
     </section>
 
@@ -1407,46 +1413,42 @@ function replayInto(box, R, sku, autoplay) {
   q('[data-r="play"]').addEventListener("click", () => { cancelAnimationFrame(raf); raf = null; setWeek(0); play(); });
   if (autoplay === "now") { setWeek(0); play(); } else if (autoplay) watchInView(box, () => { if (live()) { setWeek(0); play(); } });
 }
-function renderReplay(id) {
-  // Featured lot uses the precomputed representative season; any other product is simulated in-browser (ENGINE).
-  const box = $("#replay"), sku = D.skus.find((s) => s.id === (id || D.replay.sku));
-  const R = sku.id === D.replay.sku ? D.replay : ENG.season(sku, { wos: 40, selic: 0.065, surprise: 0, scenarios: 40 });
-  replayInto(box, R, sku, id ? "now" : true);
-  const opts = [...D.skus].sort((a, b) => a.cat.localeCompare(b.cat) || b.q - a.q);
-  box.querySelector("h2").innerHTML = `Season replay · <select class="pick" id="replaySku" aria-label="Product to replay">${opts.map((s) => `<option value="${s.id}" ${s.id === sku.id ? "selected" : ""}>${s.label} ${s.code} · ${CAT[s.cat].label}</option>`).join("")}</select>`;
-  $("#replaySku").addEventListener("change", (e) => {
-    const v = e.target.value; box.querySelector('[data-r="verdict"]').innerHTML = `<span class="hand">one sec</span><span class="spin"></span> Simulating this product's season…`;
-    if ($("#raceSku")) $("#raceSku").value = v;
-    setTimeout(() => renderReplay(v), 30);
-  });
-}
-function renderRace() {
-  const box = $("#race"), opts = [...D.skus].sort((a, b) => a.cat.localeCompare(b.cat) || b.q - a.q);
-  box.innerHTML = `<div class="replay-top"><div><h2>Race the AI on any product</h2><p>Runs the trained agent, the exact planner and the weekly optimizer right here in your browser, ported from the Python engine and tested against it.</p></div></div>
-    <div class="race-ctl">
-      <div class="ctl"><label for="raceSku">Product</label><select id="raceSku">${opts.map((s) => `<option value="${s.id}" ${s.id === "704ef63a" ? "selected" : ""}>${s.label} ${s.code} · ${CAT[s.cat].label}</option>`).join("")}</select></div>
-      <div class="ctl"><label for="raceWos">Stock on hand <span class="num" id="raceWosV">30 wks</span></label><input type="range" id="raceWos" min="4" max="52" step="1" value="30"></div>
-      <div class="ctl"><label>True demand vs estimate</label><div class="seg" style="grid-template-columns:repeat(3,1fr)" id="raceSur"><button type="button" data-s="-1">more elastic</button><button type="button" data-s="0" aria-pressed="true">as estimated</button><button type="button" data-s="1">less elastic</button></div></div>
-      <button class="btn pri" type="button" id="raceGo">Run season</button>
-    </div><div id="raceOut"></div>`;
-  let sur = 0;
-  $("#raceWos").addEventListener("input", (e) => ($("#raceWosV").textContent = e.target.value + " wks"));
-  box.querySelectorAll("[data-s]").forEach((b) => b.addEventListener("click", () => { sur = +b.dataset.s; box.querySelectorAll("[data-s]").forEach((x) => x.setAttribute("aria-pressed", String(x === b))); }));
-  $("#raceGo").addEventListener("click", async () => {
-    const out = $("#raceOut"), sku = D.skus.find((s) => s.id === $("#raceSku").value);
-    out.innerHTML = `<p class="offline"><span class="spin"></span> Simulating 40 seasons × 5 strategies…</p>`;
-    await new Promise((r) => setTimeout(r, 40));   // let the spinner paint before the number crunching
-    try {
-      const R = ENG.season(sku, { wos: +$("#raceWos").value, selic: 0.065, surprise: sur, scenarios: 40 });
-      out.innerHTML = `<section class="block replay" style="background:var(--panel-2)"></section>`;
-      replayInto(out.firstChild, R, sku, "now");
-      const E = R.expected, names = { hold: "Hold today's price", weekly: "Weekly optimizer (Phase 4)", planner: "Exact planner (estimated ε)", agent: "AI season planner (PPO)", oracle: "Oracle (knows true ε)" };
-      const best = Math.max(E.planner.npv, E.agent.npv);
-      out.insertAdjacentHTML("beforeend", `<div class="tbl-wrap" style="margin-top:14px"><table><thead><tr><th>Strategy · ${R.scenarios} demand scenarios</th><th class="r">Expected season profit</th><th class="r">Sell-through</th><th class="r">Avg price vs today</th></tr></thead><tbody>
-        ${Object.keys(names).map((k) => `<tr style="cursor:default"><td>${k === "agent" ? "<b>" + names[k] + "</b>" : names[k]}</td><td class="r num ${E[k].npv < 0 ? "down" : ""}">${brl(E[k].npv)}</td><td class="r num">${Math.round(E[k].sold * 100)}%</td><td class="r num">${E[k].price.toFixed(2)}×</td></tr>`).join("")}
-        </tbody></table></div><div class="why"><span class="hand">value of knowing the truth</span>${Math.abs(R.eps_true - R.eps) < 1e-6 ? `Here true demand matches the estimate, so the exact planner already equals the oracle. Switch "true demand" to more or less elastic to see what a pricing experiment would be worth.` : `The oracle knows the true price sensitivity (${R.eps_true.toFixed(2)} vs the estimate ${R.eps.toFixed(2)}) and earns ${brl(E.oracle.npv - best)} more than the best realistic strategy. That is the most a pricing experiment on this lot could be worth.`}</div>`);
-    } catch (e) { out.innerHTML = `<p class="offline">${e.message}</p>`; }
-  });
+const RP = { id: null, wos: 40, sur: 0, open: false };   // replay panel state; defaults = the featured season
+const RP_NAMES = { hold: "Hold today's price", weekly: "Weekly optimizer (Phase 4)", planner: "Exact planner (estimated ε)", agent: "AI season planner (PPO)", oracle: "Oracle (knows true ε)" };
+function renderReplay() {
+  const box = $("#replay"), opts = [...D.skus].sort((a, b) => a.cat.localeCompare(b.cat) || b.q - a.q);
+  RP.id = RP.id || D.replay.sku;
+  box.innerHTML = `<div class="replay-body" id="rpView"></div>
+    <button class="btn more-tog" type="button" id="rpTog" aria-expanded="${RP.open}" aria-controls="rpMore">More options<svg viewBox="0 0 12 12"><path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+    <div class="more ${RP.open ? "open" : ""}" id="rpMore"><div>
+      <div class="race-ctl">
+        <div class="ctl"><label for="rpWos">Stock on hand <span class="num" id="rpWosV">${RP.wos} wks</span></label><input type="range" id="rpWos" min="4" max="52" step="1" value="${RP.wos}"></div>
+        <div class="ctl"><label>True demand vs estimate</label><div class="seg" style="grid-template-columns:repeat(3,1fr)">${[[-1, "more elastic"], [0, "as estimated"], [1, "less elastic"]].map(([v, t]) => `<button type="button" data-s="${v}" aria-pressed="${v === RP.sur}">${t}</button>`).join("")}</div></div>
+      </div><div id="rpExtra"></div></div></div>`;
+  const run = () => {
+    const sku = D.skus.find((s) => s.id === RP.id), view = $("#rpView");
+    // The featured season is precomputed (a representative scenario); anything else runs in-browser (ENGINE).
+    const featured = sku.id === D.replay.sku && RP.wos === 40 && RP.sur === 0 && !RP.open;
+    let R;
+    try { R = featured ? D.replay : ENG.season(sku, { wos: RP.wos, selic: 0.065, surprise: RP.sur, scenarios: 40 }); }
+    catch (e) { $("#rpExtra").innerHTML = `<p class="offline">${e.message}</p>`; return; }
+    replayInto(view, R, sku, RP.started ? "now" : true); RP.started = true;
+    view.querySelector("h2").innerHTML = `Season replay · <select class="pick" id="rpSku" aria-label="Product to replay">${opts.map((s) => `<option value="${s.id}" ${s.id === sku.id ? "selected" : ""}>${s.label} ${s.code} · ${CAT[s.cat].label}</option>`).join("")}</select>`;
+    $("#rpSku").addEventListener("change", (e) => { RP.id = e.target.value; busy(); });
+    $("#rpExtra").innerHTML = RP.open ? extras(R) : "";
+  };
+  const busy = () => { const v = $("#rpView [data-r=verdict]"); if (v) v.innerHTML = `<span class="hand">one sec</span><span class="spin"></span> Simulating this season…`; setTimeout(run, 30); };
+  const extras = (R) => {
+    const E = R.expected, best = Math.max(E.planner.npv, E.agent.npv);
+    return `<div class="tbl-wrap"><table><thead><tr><th>Strategy · ${R.scenarios} demand scenarios</th><th class="r">Expected season profit</th><th class="r">Sell-through</th><th class="r">Avg price vs today</th></tr></thead><tbody>
+      ${Object.keys(RP_NAMES).map((k) => `<tr style="cursor:default"><td>${k === "agent" ? "<b>" + RP_NAMES[k] + "</b>" : RP_NAMES[k]}</td><td class="r num ${E[k].npv < 0 ? "down" : ""}">${brl(E[k].npv)}</td><td class="r num">${Math.round(E[k].sold * 100)}%</td><td class="r num">${E[k].price.toFixed(2)}×</td></tr>`).join("")}
+      </tbody></table></div><div class="why"><span class="hand">value of knowing the truth</span>${Math.abs(R.eps_true - R.eps) < 1e-6 ? `Here true demand matches the estimate, so the exact planner already equals the oracle. Switch "true demand" to more or less elastic to see what a pricing experiment would be worth.` : E.oracle.npv - best < 1 ? `The true price sensitivity is ${R.eps_true.toFixed(2)} vs the estimate ${R.eps.toFixed(2)}, yet the oracle earns no more than the best realistic strategy: here the same prices are right either way, so a pricing experiment on this lot would be worth nothing.` : `The oracle knows the true price sensitivity (${R.eps_true.toFixed(2)} vs the estimate ${R.eps.toFixed(2)}) and earns ${brl(E.oracle.npv - best)} more than the best realistic strategy. That is the most a pricing experiment on this lot could be worth.`}</div>`;
+  };
+  $("#rpTog").addEventListener("click", (e) => { RP.open = !RP.open; e.currentTarget.setAttribute("aria-expanded", String(RP.open)); $("#rpMore").classList.toggle("open", RP.open); busy(); });
+  $("#rpWos").addEventListener("input", (e) => ($("#rpWosV").textContent = e.target.value + " wks"));
+  $("#rpWos").addEventListener("change", (e) => { RP.wos = +e.target.value; busy(); });
+  box.querySelectorAll("[data-s]").forEach((b) => b.addEventListener("click", () => { RP.sur = +b.dataset.s; box.querySelectorAll("[data-s]").forEach((x) => x.setAttribute("aria-pressed", String(x === b))); busy(); }));
+  RP.started = false; run();
 }
 
 /* ---------- scenario lab ---------- */
@@ -1542,7 +1544,7 @@ function paintLab(p, r, engine) {
   $("#labNote").innerHTML = `<span class="hand">${r.cut ? "now discounts start to pay" : "why no discounts?"}</span>${r.cut ? `With this much stock and money this expensive, holding inventory costs more than the margin a discount gives up on ${r.cut} products.` : "Margins are thin, so a discount only pays when buyers are far more price-sensitive than they are. Push the stock slider and switch to cash recovery to see that change."}`;
   labPrev = r;
 }
-const VIEWS = { overview: null, products: renderProducts, planner: () => { renderReplay(); renderRace(); renderPlanner(); const ov = (k) => RL(k, "overstock").npv; $("#plLoss").textContent = brl(ov("status quo")); $("#plWin").textContent = brl(ov("PPO agent")); countUp($("#plWin"), ov("PPO agent"), (v) => brl(v), 1300); }, evidence: renderEvidence, lab: renderLab };
+const VIEWS = { overview: null, products: renderProducts, planner: () => { renderReplay(); renderPlanner(); const ov = (k) => RL(k, "overstock").npv; $("#plLoss").textContent = brl(ov("status quo")); $("#plWin").textContent = brl(ov("PPO agent")); countUp($("#plWin"), ov("PPO agent"), (v) => brl(v), 1300); }, evidence: renderEvidence, lab: renderLab };
 function show(v) {
   if (!(v in VIEWS)) v = "overview";
   document.querySelectorAll(".view").forEach((s) => (s.hidden = s.id !== "v-" + v));
