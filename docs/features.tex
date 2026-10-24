@@ -1,0 +1,134 @@
+% Margem: technical feature map. Build with: tectonic docs/features.tex
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=2cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{xltabular}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+
+\definecolor{accent}{HTML}{5B63D3}
+\titleformat{\section}{\large\bfseries\color{accent}}{}{0pt}{}
+\titlespacing*{\section}{0pt}{14pt}{6pt}
+\renewcommand{\arraystretch}{1.25}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcolumntype{F}{>{\raggedright\arraybackslash}p{0.22\linewidth}}
+\newcolumntype{U}{>{\raggedright\arraybackslash}X}
+\newcolumntype{C}{>{\raggedright\arraybackslash}p{0.21\linewidth}}
+\newcolumntype{S}{>{\raggedright\arraybackslash}p{0.18\linewidth}}
+
+% \featuretable{rows}: Feature | Used for | Code | On the site
+\newenvironment{featuretable}
+  {\xltabular{\linewidth}{F U C S}
+   \toprule \textbf{Feature} & \textbf{What it is used for} & \textbf{Code} & \textbf{On the site} \\ \midrule \endhead}
+  {\bottomrule \endxltabular}
+
+\title{\textbf{Margem: technical feature map}\\[4pt]
+  \large Algorithmic Working Capital \& Margin Optimization}
+\author{Causal Double-ML dynamic pricing and liquidity engine on Olist data}
+\date{24 October 2026}
+
+\begin{document}
+\maketitle
+
+Every technical feature in the project, what it is for, where the code lives and where it shows up on the
+website (\href{https://operator-x.github.io/margem/}{\code{operator-x.github.io/margem}}). Code paths are
+relative to the repository root.
+
+\section{Phase 1: Data and unit economics}
+\begin{featuretable}
+Weekly product sales table & Turns raw Olist orders into weekly sales per product (118 products) & \code{engine/data.py} & Feeds everything \\
+Profit per sale (CM2) & Profit after cost, 10\% fee and freight; the optimisation target, never revenue & \code{engine/finance.py} & Products page, product pop-up \\
+Assumed product costs & Olist publishes no costs, so each category gets a fixed share of price & \code{engine/data.py}, \code{engine/config.py} & All profit numbers \\
+SELIC interest-rate feed & Pulls Brazil's official interest rate from the central bank API & \code{engine/finance.py} & Overview header, Scenario lab \\
+Holding cost (SELIC + 6\%) & What it costs to keep stock sitting unsold & \code{engine/finance.py} & Product pop-up, Scenario lab \\
+Days of stock, safety stock & How long stock lasts and how much buffer is needed & \code{engine/finance.py} & Products page \\
+\end{featuretable}
+
+\section{Phase 2: Forecasting}
+\begin{featuretable}
+LightGBM forecast (Tweedie loss) & Predicts next week's sales; handles the 52\% of weeks with zero sales & \code{engine/forecast.py} & Product $\to$ Forecast \\
+Seasonal naive and SARIMAX & Simple benchmarks to beat & \code{engine/forecast.py} & Evidence $\to$ forecast pop-up \\
+Walk-forward testing & Tests forecasts without ever peeking at the future & \code{engine/forecast.py} & Evidence \\
+Leakage fix (last week's price) & Stops the model using information it would not have had & \code{engine/forecast.py} & Covered by tests \\
+Money-based scoring & Turns forecast error into stockout losses and cash tied up & \code{engine/forecast.py} & Evidence \\
+\end{featuretable}
+
+\section{Phase 3: Causal price sensitivity}
+\begin{featuretable}
+Double ML & Measures how price really changes demand, removing coincidences such as Black Friday & \code{engine/elasticity.py} & Evidence page (main chart) \\
+Cross-fitting in time blocks & Keeps the ML models from leaking future data into the estimate & \code{engine/elasticity.py} & Evidence $\to$ statistics \\
+Product fixed effects, clustered standard errors & Compares each product with itself; honest error bars & \code{engine/elasticity.py} & Evidence (error bars) \\
+Naive and pooled regression & Shows what goes wrong without causal methods (about 3$\times$ overstated) & \code{engine/elasticity.py} & Evidence headline ``3$\times$'' \\
+DerSimonian--Laird shrinkage & Stabilises noisy per-product estimates by pulling them toward the category average & \code{engine/elasticity.py} & Product pop-up \\
+Corrections (log fix, sign restriction, cap at $-5$) & Keeps estimates economically sensible & \code{engine/elasticity.py} & Product pop-up chips \\
+Robustness check (weeks with sales) & Confirms the result holds under a second definition & \code{engine/elasticity.py} & Evidence $\to$ statistics \\
+\end{featuretable}
+
+\section{Phase 4: Price optimiser}
+\begin{featuretable}
+Profit-maximising price search & Finds the best price (401-point grid, then Brent refinement) & \code{engine/optimize.py} & Overview cards, product pop-up \\
+Price floor (1.15$\times$ cost; 1.00$\times$ if stock is old) & Never sells below cost; allows clearance of stock older than 8 weeks of supply & \code{engine/optimize.py} & Product pop-up chips \\
+$\pm$15\% price band & Never shocks buyers with large jumps & \code{engine/optimize.py} & Overview card text \\
+Margin vs cash-recovery modes & Optimise this week's profit, or clear stock to free cash & \code{engine/optimize.py} & Scenario lab goal switch \\
+Uncertainty band & Re-solves the price under 200 draws of price sensitivity & \code{engine/optimize.py} & Product $\to$ Simulate \\
+Lerner discount test & Checks whether any discount could add profit (none of 72 do) & \code{engine/finance.py} & Evidence, Overview \\
+\end{featuretable}
+
+\section{Phase 5A: AI season planner (reinforcement learning)}
+\begin{featuretable}
+26-week season simulator & Sells one lot of stock; leftovers go to an outlet at half of cost & \code{engine/rl.py} & Season planner \\
+Bayesian demand learning & The planner updates its estimate of price sensitivity from its own sales & \code{engine/rl.py} & Season replay \\
+PPO agent & The AI that decides each week whether to hold the price or start clearing & \code{engine/rl.py} & Season replay (``AI season planner'') \\
+Exact plan and oracle (dynamic programming) & Benchmarks: the best possible plan, and one that knows true demand & \code{engine/rl.py} & Season replay $\to$ More options \\
+Value of information & What knowing true demand would be worth & \code{engine/rl.py} & ``Value of knowing the truth'' note \\
+Out-of-sample scorecard & Results over 30 unseen seasons per product & \code{engine/rl.py} & Bottom chart of the Season planner \\
+\end{featuretable}
+
+\section{Phase 5B: GenAI forecasting}
+\begin{featuretable}
+Chronos-Bolt and Chronos-2 & Amazon foundation models that forecast with no training on our data & \code{engine/foundation.py} & Evidence $\to$ forecast pop-up \\
+LightGBM quantile forecasts & Our trained model's low / median / high forecasts & \code{engine/foundation.py} & Product $\to$ Forecast band \\
+Newsvendor stocking backtest & Compares models by stockouts and cash tied up in stock & \code{engine/foundation.py} & Evidence $\to$ forecast pop-up \\
+\end{featuretable}
+
+\section{Phase 5C: LLM customer voice}
+\begin{featuretable}
+Claude review labelling & Scores 3,351 reviews for sentiment, quality, late delivery and value & \code{engine/reviews.py} & Product $\to$ What buyers say \\
+Reviews as Double-ML controls & Makes the price estimate more accurate ($-0.34 \to -0.45$) & \code{engine/elasticity.py}, \code{engine/pipeline.py} & Evidence $\to$ voice card \\
+Validation against star ratings & Shows the labels are trustworthy (87.7\% agreement) & \code{engine/reviews.py} & Evidence $\to$ voice card \\
+Moderation test & Asks whether reviews change how price-sensitive buyers are & \code{engine/elasticity.py} & Voice card $\to$ details \\
+\end{featuretable}
+
+\section{Phase 6: Margem web app}
+\begin{featuretable}
+Five-page app & Overview, Products, Season planner, Evidence, Scenario lab & \code{web/template.html} & Whole site \\
+Capi mascot and hand-drawn style & A memorable identity & \code{web/template.html}, \code{brand/} & Everywhere \\
+Expanding cards, scroll animations & ``Simple first, details on request'' & \code{web/template.html} & Everywhere \\
+Cmd+K product search & Jump to any product quickly & \code{web/template.html} & Press Cmd+K \\
+Scenario lab & Re-prices all 72 products live as interest rates, stock and fees change & \code{web/template.html} & Scenario lab \\
+In-browser engine & Optimiser and AI planner ported to JavaScript, so everything runs on a phone & \code{web/template.html} (ENGINE block) & Simulate, Season replay, Scenario lab \\
+Data export & Packs all results into the page & \code{engine/webexport.py} & Not visible \\
+Optional Python server & The same page served by FastAPI, with API endpoints & \code{engine/api.py} & Not used by the public site \\
+GitHub Pages hosting & Public website with no server & \code{web/publish.sh} & \href{https://operator-x.github.io/margem/}{Public website} \\
+QR codes and Capi images & Poster assets & \code{brand/make\_qr.py}, \code{brand/render\_capi.js} & Poster \\
+\end{featuretable}
+
+\section{Running everything and quality}
+\begin{xltabular}{\linewidth}{F U C}
+\toprule \textbf{Feature} & \textbf{What it is used for} & \textbf{Code} \\ \midrule \endhead
+One-command pipeline & Runs Phases 1--6 and writes the results report & \code{engine/pipeline.py} \\
+Central settings (seed 42, fees, floors) & One place for every rule; reproducible results & \code{engine/config.py} \\
+Results report & All result tables in one file & \code{reports/results.md} \\
+40 automated tests & Checks guardrails, data leakage, the AI benchmarks, and that the browser matches Python & \code{tests/} \\
+Separate processes for PyTorch and LightGBM & Prevents a crash when both load on macOS & \code{engine/foundation.py}, \code{engine/webexport.py} \\
+\bottomrule
+\end{xltabular}
+
+\end{document}
