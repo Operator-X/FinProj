@@ -178,6 +178,7 @@ body.no-sketch .sketch { display: none !important; }
 @keyframes rot { to { transform: rotate(360deg); } }
 .race { padding: 22px 24px; display: flex; flex-direction: column; gap: 16px; }
 .race-ctl { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1.3fr) auto; gap: 14px; align-items: end; }
+.replay-top select.pick { background: var(--panel-2); color: var(--fg); border: 1px solid var(--line-2); border-radius: 8px; padding: 3px 8px; font: inherit; font-size: 14px; font-weight: 600; max-width: 100%; cursor: pointer; }
 .race-ctl select { width: 100%; background: var(--panel-2); color: var(--fg); border: 1px solid var(--line-2); border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px; }
 .sortable th { cursor: pointer; user-select: none; }
 .sortable th:hover { color: var(--fg); }
@@ -1368,7 +1369,7 @@ function renderProducts() {
 const POLS = [["hold", "Hold today's price", "#9aa0aa"], ["weekly", "Weekly optimizer", "#eb6834"], ["agent", "AI season planner", "#8b97ff"]];
 function replayInto(box, R, sku, autoplay) {
   const H = 26;
-  box.innerHTML = `<div class="replay-top"><div><h2>Season replay · ${sku.label} ${sku.code}</h2><p>${R.lot} units on hand, 26 weeks to sell them. Leftovers go to an outlet at half of cost. Same demand for all three.</p></div>
+  box.innerHTML = `<div class="replay-top"><div><h2>Season replay · ${sku.label} ${sku.code}</h2><p>${R.lot} units on hand (about ${Math.round(R.lot / Math.max(sku.q, 1e-9))} weeks of sales), 26 weeks to sell them. Leftovers go to an outlet at half of cost. Same demand for all three.</p></div>
     <div style="display:flex;align-items:center;gap:12px"><span class="wk" data-r="wk">week 0</span><button class="play" data-r="play" type="button"><svg viewBox="0 0 16 16"><path d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg>Play season</button></div></div>
     <div class="chart"><svg data-r="chart" viewBox="0 0 800 300" role="img" aria-label="Price and stock path over 26 weeks for three pricing policies"></svg></div>
     <div class="scoreboard">${POLS.map(([k, n, c]) => `<div class="score" data-sc="${k}"><small><i style="background:${c}"></i>${n}</small><span class="num" data-k="${k}">${R.lot} left</span><span class="meta" data-m="${k}">week 0</span></div>`).join("")}</div>
@@ -1392,7 +1393,8 @@ function replayInto(box, R, sku, autoplay) {
   const lens = Object.fromEntries(Object.entries(lines).map(([k, ps]) => [k, ps.map((p) => p.getTotalLength())]));
   const verdict = () => {
     const best = POLS.reduce((a, b) => (R.paths[b[0]].npv > R.paths[a[0]].npv ? b : a)), wk = R.paths.weekly, ag = R.paths.agent;
-    let msg = `${best[1]} finished best on this season: ${brl(R.paths[best[0]].npv)}. `;
+    const top = POLS.filter(([k]) => Math.abs(R.paths[k].npv - R.paths[best[0]].npv) < 0.5).map((p) => p[1]);
+    let msg = top.length > 1 ? `${top.join(" and ")} tied for best on this season: ${brl(R.paths[best[0]].npv)}. ` : `${best[1]} finished best on this season: ${brl(R.paths[best[0]].npv)}. `;
     if (wk.sold < ag.sold - 0.05) msg += `The weekly optimizer chased margin and was still holding ${Math.round((1 - wk.sold) * 100)}% of its stock at the end, written down to half of cost (${brl(wk.npv)}). `;
     if (R.expected) msg += `Over ${R.scenarios} demand scenarios: AI planner ${brl(R.expected.agent.npv)}, exact planner ${brl(R.expected.planner.npv)}, weekly ${brl(R.expected.weekly.npv)}, hold ${brl(R.expected.hold.npv)}.`;
     else if (R.mean_gap !== undefined) msg += `Averaged over 60 demand scenarios the AI planner beats holding the price by ${brl(R.mean_gap)} on this lot.`;
@@ -1409,14 +1411,28 @@ function replayInto(box, R, sku, autoplay) {
     box.querySelectorAll(".score").forEach((s) => s.classList.toggle("win", wi >= H && s.dataset.sc === best[0]));
     q('[data-r="verdict"]').innerHTML = `<span class="hand">the twist</span>` + (wi >= H ? verdict() : "Watch which one is still stuck with stock at week 26…");
   };
+  // A re-render (new product) supersedes this replay: stale animations and in-view replays must stop touching the box.
+  cancelAnimationFrame(box._raf); const gen = (box._gen = (box._gen || 0) + 1), live = () => box._gen === gen;
   let raf = null;
-  const play = () => { if (raf) return; const t0 = performance.now(), dur = reduce ? 0 : 6500;
-    const tick = (t) => { const w = dur ? Math.min(H, ((t - t0) / dur) * H) : H; setWeek(w); raf = w < H ? requestAnimationFrame(tick) : null; }; raf = requestAnimationFrame(tick); };
+  const play = () => { if (raf || !live()) return; const t0 = performance.now(), dur = reduce ? 0 : 6500;
+    const tick = (t) => { if (!live()) return; const w = dur ? Math.min(H, Math.max(0, ((t - t0) / dur) * H)) : H; /* rAF stamps can precede t0 */ setWeek(w); raf = box._raf = w < H ? requestAnimationFrame(tick) : null; }; raf = box._raf = requestAnimationFrame(tick); };
   setWeek(H);
   q('[data-r="play"]').addEventListener("click", () => { cancelAnimationFrame(raf); raf = null; setWeek(0); play(); });
-  if (autoplay === "now") { setWeek(0); play(); } else if (autoplay) watchInView(box, () => { setWeek(0); play(); });
+  if (autoplay === "now") { setWeek(0); play(); } else if (autoplay) watchInView(box, () => { if (live()) { setWeek(0); play(); } });
 }
-function renderReplay() { replayInto($("#replay"), D.replay, D.skus.find((s) => s.id === D.replay.sku), true); }
+function renderReplay(id) {
+  // Featured lot uses the precomputed representative season; any other product is simulated in-browser (ENGINE).
+  const box = $("#replay"), sku = D.skus.find((s) => s.id === (id || D.replay.sku));
+  const R = sku.id === D.replay.sku ? D.replay : ENG.season(sku, { wos: 40, selic: 0.065, surprise: 0, scenarios: 40 });
+  replayInto(box, R, sku, id ? "now" : true);
+  const opts = [...D.skus].sort((a, b) => a.cat.localeCompare(b.cat) || b.q - a.q);
+  box.querySelector("h2").innerHTML = `Season replay · <select class="pick" id="replaySku" aria-label="Product to replay">${opts.map((s) => `<option value="${s.id}" ${s.id === sku.id ? "selected" : ""}>${s.label} ${s.code} · ${CAT[s.cat].label}</option>`).join("")}</select>`;
+  $("#replaySku").addEventListener("change", (e) => {
+    const v = e.target.value; box.querySelector('[data-r="verdict"]').innerHTML = `<span class="hand">one sec</span><span class="spin"></span> Simulating this product's season…`;
+    if ($("#raceSku")) $("#raceSku").value = v;
+    setTimeout(() => renderReplay(v), 30);
+  });
+}
 function renderRace() {
   const box = $("#race"), opts = [...D.skus].sort((a, b) => a.cat.localeCompare(b.cat) || b.q - a.q);
   box.innerHTML = `<div class="replay-top"><div><h2>Race the AI on any product</h2><p>Runs the trained agent, the exact planner and the weekly optimizer right here in your browser, ported from the Python engine and tested against it.</p></div></div>

@@ -583,7 +583,7 @@ Every page follows the same formula: a one-sentence headline with an underlined 
 |---|---|---|---|
 | **Overview** | 4 | *"You could earn R$618 more this week."* | Four 2-up live cards (weekly CM2 with a "next week" projection, cash in stock, forecast error, RL uplift); "3 things to do this week" with Approve flows |
 | **Products** | 1, 4 | *"R$7,362 is stuck in products that lose money."* | Capital-traps and cash-machines cards; the capital map (margin × weekly sales × cash), annotated by hand |
-| **Season planner** | 5A | *"Planning ahead turns a −R$204 season into R$62 profit."* | **Season replay** of one real lot over 26 weeks, comparing holding the price, the weekly optimiser and the AI planner on identical demand, with a live scoreboard and a closing verdict; out-of-sample policy chart and table |
+| **Season planner** | 5A | *"Planning ahead turns a −R$204 season into R$62 profit."* | **Season replay** with a product picker: it opens on one featured lot, and any of the 72 products can be chosen and re-simulated in the browser in under 0.1 s. Each replay runs 26 weeks, comparing holding the price, the weekly optimiser and the AI planner on identical demand, with a live scoreboard and a closing verdict; out-of-sample policy chart and table |
 | **Evidence** | 2, 3, 5B | *"A naive model thinks discounts work 2.9× better than they do."* | Naive vs Double-ML bars by category; forecast-error and GenAI-capital cards |
 | **Scenario lab** | 4, 0 | *"At SELIC 15.00% with 20 weeks of stock, the engine cuts 13 prices…"* | Rate presets (Brazil 2016: 14.25%, 2018: 6.50%, 2025: 15.00%); sliders for stock, platform fee and seller-paid shipping; goal toggle (this week's profit or cash recovery). All 72 products re-price live in the browser, using the Phase 4 objective and the Phase 0 guardrails |
 
@@ -601,8 +601,8 @@ Motion follows `prefers-reduced-motion`, and every page is complete without it: 
 
 ### 11.4 Build and sharing
 
-- **Build:** `engine/webexport.py` reads the Phase 1–5 artifacts, generates the product names, and computes the season replay in a PyTorch child process (process-isolation rule). It writes `web/data.json` (about 27 KB) and injects it into `web/template.html`, producing **one self-contained file** that works offline on a laptop.
-- **Representative replay:** the season replay uses the demand scenario whose AI-vs-hold gap is closest to the mean over 60 scenarios, so the demo is representative rather than lucky.
+- **Build:** `engine/webexport.py` reads the Phase 1–5 artifacts, generates the product names, and computes the season replay in a PyTorch child process (process-isolation rule). It writes `web/data.json` (about 0.5 MB) and injects it into `web/template.html`, producing **one self-contained file** that works offline on a laptop.
+- **Representative replay:** the featured season replay uses the demand scenario whose AI-vs-hold gap is closest to the mean over 60 scenarios, so the demo is representative rather than lucky.
 - **Hosting:** `web/site/` is the standalone website (full HTML document, Capi favicon, link-preview tags). `web/publish.sh` copies only those files into a separate public repo (`Operator-X/margem`) served by GitHub Pages at **https://operator-x.github.io/margem/**. No code or data beyond the page is published.
 - **Poster QR codes:** `brand/qr/` holds light and dark versions pointing at that URL (Capi in the centre, error correction H, 4-module quiet zone), verified to decode at sizes from 15% to 100%. The URL never changes, so republishing never invalidates them.
 
